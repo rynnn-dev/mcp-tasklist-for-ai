@@ -1,0 +1,25 @@
+{
+  "name": "moex",
+  "version": "1.0.0",
+  "description": "moex — Autonomous whole-project tasklist MCP server and CLI for local AI coding agents (Claude Code, OpenCode, Antigravity)",
+  "type": "module",
+  "bin": {
+    "moex": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts serve",
+    "cli": "bun run src/index.ts",
+    "build:bin": "mkdir -p dist && bun build --compile --minify --no-compile-autoload-dotenv --no-compile-autoload-bunfig --outfile dist/moex src/index.ts",
+    "docker:build": "docker build -t moex:latest .",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.20.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.8.0"
+  }
+}

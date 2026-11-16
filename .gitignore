@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Build & TypeScript outputs
+dist/
+out/
+*.tsbuildinfo
+
+# Local SQLite databases & journals
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+
+# Instance-local moex / tasklist configurations
+.moex*.json
+.tasklist*.json
+
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Logs, coverage, & temp directories
+coverage/
+*.log
+npm-debug.log*
+.tmp/
+tmp/
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
