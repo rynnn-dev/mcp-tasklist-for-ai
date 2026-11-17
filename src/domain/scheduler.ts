@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs";
+import path from "node:path";
 import {
   doRepoPathsConflict,
   normalizeRepoPaths,
@@ -17,6 +19,7 @@ import {
   type TaskPriority,
   type TaskRecord,
   type TaskStatus,
+  type VerificationProgressUpdate,
   type VerificationResult,
 } from "../types.ts";
 import {
@@ -65,6 +68,7 @@ export interface UpdateTaskPatch {
   append_modified_files?: boolean;
   handoff_notes?: string;
   heartbeat?: boolean;
+  release_claim?: boolean;
   reset_to_pending?: boolean;
   reset_attempts?: boolean;
   add_depends_on?: string[];
@@ -77,6 +81,8 @@ export interface CompleteTaskParams {
   handoff_notes?: string;
   modified_files?: string[];
   skip_verification_run?: boolean;
+  on_progress?: (update: VerificationProgressUpdate) => void | Promise<void>;
+  progress_interval_ms?: number;
 }
 
 export interface CompleteTaskResult {
@@ -117,6 +123,7 @@ export interface ProjectSummaryResult {
     blocker_reason: string;
   }>;
   execution_waves: Array<{ wave: number; task_ids: string[] }>;
+  recent_events: TaskEventRecord[];
 }
 
 function isPlainObject(val: unknown): val is Record<string, unknown> {
@@ -879,10 +886,22 @@ export class TaskScheduler {
       if (patch.handoff_notes !== undefined) {
         updateFields.handoff_notes = patch.handoff_notes.trim();
       }
-      if (patch.heartbeat) {
+      if (patch.heartbeat && !patch.release_claim) {
         if (existing.status === "in_progress") {
           updateFields.heartbeat_at = now;
         }
+      }
+      if (patch.release_claim && !patch.reset_to_pending) {
+        if (existing.status !== "in_progress") {
+          throw new TasklistError(
+            "INVALID_STATE_TRANSITION",
+            `Cannot release claim on task "${taskId}" because its status is "${existing.status}" (expected "in_progress").`
+          );
+        }
+        updateFields.status = "pending";
+        updateFields.claimed_by = null;
+        updateFields.claimed_at = null;
+        updateFields.heartbeat_at = null;
       }
       if (patch.reset_to_pending) {
         updateFields.status = "pending";
@@ -931,7 +950,7 @@ export class TaskScheduler {
               )}) to already-completed task "${taskId}". Pass reset_to_pending=true to reopen it first.`
             );
           }
-          if (existing.status === "in_progress") {
+          if (existing.status === "in_progress" && !patch.release_claim) {
             suspendedByAddedDeps = unfinishedAddedDeps;
           }
         }
@@ -985,8 +1004,18 @@ export class TaskScheduler {
           { prerequisite_ids: suspendedByAddedDeps }
         );
       }
+      if (patch.release_claim && !patch.reset_to_pending) {
+        this.repo.recordEvent(
+          projectId,
+          taskId,
+          "TASK_CLAIM_RELEASED",
+          effectiveActor,
+          { previous_owner: existing.claimed_by }
+        );
+      }
       this.repo.recordEvent(projectId, taskId, "TASK_UPDATED", effectiveActor, {
         reset_to_pending: patch.reset_to_pending ?? false,
+        release_claim: patch.release_claim ?? false,
         heartbeat: patch.heartbeat ?? false,
       });
 
@@ -1093,6 +1122,36 @@ export class TaskScheduler {
         taskCommand: preflight.task.verification_command,
         defaultCommand: preflight.resolved.config.default_verification_command,
         timeoutMs: preflight.resolved.config.verification_timeout_ms,
+        progressIntervalMs: params.progress_interval_ms,
+        onProgress: async (update) => {
+          if (update.phase === "tick") {
+            try {
+              this.repo.withTransaction(() => {
+                const current = this.repo.getTaskById(
+                  preflight.resolved.config.project_id,
+                  taskId
+                );
+                if (
+                  current &&
+                  current.status === "in_progress" &&
+                  current.claimed_by === preflight.expectedClaimedBy &&
+                  current.claimed_at === preflight.expectedClaimedAt
+                ) {
+                  this.repo.updateTaskRow(
+                    preflight.resolved.config.project_id,
+                    taskId,
+                    { heartbeat_at: new Date().toISOString() }
+                  );
+                }
+              });
+            } catch {
+              // Ignore transient heartbeat errors during verification
+            }
+          }
+          if (params.on_progress) {
+            await params.on_progress(update);
+          }
+        },
       });
     }
 
@@ -1516,6 +1575,8 @@ export class TaskScheduler {
       const completionPercentage =
         counts.total === 0 ? 0 : Math.round((counts.done / counts.total) * 100);
 
+      const recentEvents = this.repo.getProjectEvents(resolved.config.project_id, 15);
+
       return {
         project,
         config: resolved.config,
@@ -1525,7 +1586,120 @@ export class TaskScheduler {
         active_tasks: activeTasks,
         blocked_or_failed_tasks: blockedOrFailed,
         execution_waves: computeTopologicalWaves(tasks),
+        recent_events: recentEvents,
       };
     });
+  }
+
+  public listRegisteredProjects(): Array<ProjectRecord & { config_exists: boolean }> {
+    return this.repo.withTransaction(() => {
+      return this.repo.listProjects().map((p) => ({
+        ...p,
+        config_exists: existsSync(p.config_path),
+      }));
+    });
+  }
+
+  public pruneOrphanedProjects(): {
+    removed_projects: Array<{ project_id: string; project_name: string; root_path: string }>;
+    remaining_count: number;
+  } {
+    return this.repo.withTransaction(() => {
+      const projects = this.repo.listProjects();
+      const removed: Array<{ project_id: string; project_name: string; root_path: string }> = [];
+
+      for (const p of projects) {
+        if (!existsSync(p.config_path)) {
+          this.repo.deleteProject(p.project_id);
+          removed.push({
+            project_id: p.project_id,
+            project_name: p.project_name,
+            root_path: p.root_path,
+          });
+        }
+      }
+
+      return {
+        removed_projects: removed,
+        remaining_count: projects.length - removed.length,
+      };
+    });
+  }
+
+  public getProjectLogs(
+    projectPath: string | undefined,
+    options: { taskId?: string; limit?: number; configFileName?: string } = {}
+  ): {
+    project: ProjectRecord;
+    events: TaskEventRecord[];
+  } {
+    return this.repo.withTransaction(() => {
+      const { resolved, project } = this.resolveAndSync(
+        projectPath,
+        options.configFileName
+      );
+      const events = this.repo.getProjectEvents(
+        resolved.config.project_id,
+        options.limit ?? 30,
+        options.taskId
+      );
+      return { project, events };
+    });
+  }
+
+  public resolveResourceTargetProject(
+    preferredDir?: string,
+    configFileName?: string
+  ): { projectPath: string; configFileName?: string } {
+    try {
+      const resolved = resolveProjectConfig(preferredDir, configFileName);
+      return {
+        projectPath: resolved.project_root,
+        configFileName: resolved.config_file_name,
+      };
+    } catch (err) {
+      if (preferredDir) {
+        throw err;
+      }
+      const registered = this.listRegisteredProjects().find((p) => p.config_exists);
+      if (!registered) {
+        throw err;
+      }
+      return {
+        projectPath: registered.root_path,
+        configFileName: path.basename(registered.config_path),
+      };
+    }
+  }
+
+  public getProjectSummaryById(projectId: string): ProjectSummaryResult {
+    const project = this.repo.getProject(projectId);
+    if (!existsSync(project.config_path)) {
+      throw new TasklistError(
+        "PROJECT_NOT_INITIALIZED",
+        `Config file for project "${project.project_name}" (${projectId}) is missing at "${project.config_path}".`
+      );
+    }
+    return this.getProjectSummary(
+      project.root_path,
+      path.basename(project.config_path)
+    );
+  }
+
+  public getProjectContextById(projectId: string): {
+    project: ProjectRecord;
+    config: ResolvedProject["config"];
+  } {
+    const project = this.repo.getProject(projectId);
+    if (!existsSync(project.config_path)) {
+      throw new TasklistError(
+        "PROJECT_NOT_INITIALIZED",
+        `Config file for project "${project.project_name}" (${projectId}) is missing at "${project.config_path}".`
+      );
+    }
+    return this.getProjectContext(
+      project.root_path,
+      path.basename(project.config_path)
+    );
   }
 }

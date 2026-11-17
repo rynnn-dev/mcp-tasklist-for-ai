@@ -1,4 +1,7 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+  McpServer,
+  ResourceTemplate,
+} from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { TaskScheduler } from "../domain/scheduler.ts";
@@ -330,6 +333,10 @@ export function createTasklistMcpServer(
           .boolean()
           .optional()
           .describe("Refresh heartbeat_at for an active in_progress task to prevent lease expiration."),
+        release_claim: z
+          .boolean()
+          .optional()
+          .describe("Cleanly release an active in_progress claim back to pending for handoff without resetting blocker/attempt metadata."),
         reset_to_pending: z
           .boolean()
           .optional()
@@ -356,6 +363,7 @@ export function createTasklistMcpServer(
             append_modified_files: args.append_modified_files,
             handoff_notes: args.handoff_notes,
             heartbeat: args.heartbeat,
+            release_claim: args.release_claim,
             reset_to_pending: args.reset_to_pending,
             reset_attempts: args.reset_attempts,
             add_depends_on: args.add_depends_on,
@@ -390,9 +398,10 @@ export function createTasklistMcpServer(
         modified_files: z.array(z.string()).optional(),
       },
     },
-    async (args) =>
-      safeToolCall(() =>
-        scheduler.completeTask(
+    async (args, extra) =>
+      safeToolCall(() => {
+        const progressToken = extra._meta?.progressToken;
+        return scheduler.completeTask(
           resolvePath(args.project_path),
           args.task_id,
           {
@@ -400,10 +409,24 @@ export function createTasklistMcpServer(
             verification_note: args.verification_note,
             handoff_notes: args.handoff_notes,
             modified_files: args.modified_files,
+            on_progress:
+              progressToken !== undefined
+                ? async (update) => {
+                    await extra.sendNotification({
+                      method: "notifications/progress",
+                      params: {
+                        progressToken,
+                        progress: update.step_index,
+                        total: update.total_steps,
+                        message: `[${update.tier}] ${update.phase} (${update.elapsed_ms}ms): ${update.command}`,
+                      },
+                    });
+                  }
+                : undefined,
           },
           resolveCfg(args.config_file)
-        )
-      )
+        );
+      })
   );
 
   // 8. block_or_fail_task
@@ -489,7 +512,7 @@ export function createTasklistMcpServer(
       )
   );
 
-  // Resource 1: Project Summary
+  // Resource 1: Project Summary (with fallback to latest registered project)
   server.registerResource(
     "project-summary",
     "moex://project/summary",
@@ -501,9 +524,13 @@ export function createTasklistMcpServer(
     },
     async (uri) => {
       try {
-        const summary = scheduler.getProjectSummary(
+        const target = scheduler.resolveResourceTargetProject(
           defaults.projectDir,
           defaults.configFileName
+        );
+        const summary = scheduler.getProjectSummary(
+          target.projectPath,
+          target.configFileName
         );
         return {
           contents: [
@@ -536,7 +563,7 @@ export function createTasklistMcpServer(
     }
   );
 
-  // Resource 2: Project Shared Context
+  // Resource 2: Project Shared Context (with fallback to latest registered project)
   server.registerResource(
     "project-context",
     "moex://project/context",
@@ -548,9 +575,13 @@ export function createTasklistMcpServer(
     },
     async (uri) => {
       try {
-        const ctx = scheduler.getProjectContext(
+        const target = scheduler.resolveResourceTargetProject(
           defaults.projectDir,
           defaults.configFileName
+        );
+        const ctx = scheduler.getProjectContext(
+          target.projectPath,
+          target.configFileName
         );
         return {
           contents: [
@@ -571,6 +602,124 @@ export function createTasklistMcpServer(
               text: JSON.stringify(
                 {
                   initialized: false,
+                  message: msg,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+    }
+  );
+
+  // Resource Template 1: Per-Project Summary by project_id
+  server.registerResource(
+    "project-summary-by-id",
+    new ResourceTemplate("moex://projects/{project_id}/summary", {
+      list: async () => ({
+        resources: scheduler
+          .listRegisteredProjects()
+          .filter((p) => p.config_exists)
+          .map((p) => ({
+            uri: `moex://projects/${p.project_id}/summary`,
+            name: `${p.project_name} Summary`,
+            description: `Tasklist summary for ${p.project_name} (${p.root_path})`,
+            mimeType: "application/json",
+          })),
+      }),
+    }),
+    {
+      title: "Project Summary by Project ID",
+      description:
+        "Tasklist summary for a specific registered project_id in the central moex database.",
+      mimeType: "application/json",
+    },
+    async (uri, variables) => {
+      const rawId = variables.project_id;
+      const projectId = Array.isArray(rawId) ? rawId[0] ?? "" : rawId ?? "";
+      try {
+        const summary = scheduler.getProjectSummaryById(projectId);
+        return {
+          contents: [
+            {
+              uri: uri.href,
+              mimeType: "application/json",
+              text: JSON.stringify(summary, null, 2),
+            },
+          ],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          contents: [
+            {
+              uri: uri.href,
+              mimeType: "application/json",
+              text: JSON.stringify(
+                {
+                  initialized: false,
+                  project_id: projectId,
+                  message: msg,
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
+    }
+  );
+
+  // Resource Template 2: Per-Project Context by project_id
+  server.registerResource(
+    "project-context-by-id",
+    new ResourceTemplate("moex://projects/{project_id}/context", {
+      list: async () => ({
+        resources: scheduler
+          .listRegisteredProjects()
+          .filter((p) => p.config_exists)
+          .map((p) => ({
+            uri: `moex://projects/${p.project_id}/context`,
+            name: `${p.project_name} Context`,
+            description: `Shared architecture context for ${p.project_name} (${p.root_path})`,
+            mimeType: "application/json",
+          })),
+      }),
+    }),
+    {
+      title: "Project Context by Project ID",
+      description:
+        "Shared architecture context for a specific registered project_id in the central moex database.",
+      mimeType: "application/json",
+    },
+    async (uri, variables) => {
+      const rawId = variables.project_id;
+      const projectId = Array.isArray(rawId) ? rawId[0] ?? "" : rawId ?? "";
+      try {
+        const ctx = scheduler.getProjectContextById(projectId);
+        return {
+          contents: [
+            {
+              uri: uri.href,
+              mimeType: "application/json",
+              text: JSON.stringify(ctx, null, 2),
+            },
+          ],
+        };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          contents: [
+            {
+              uri: uri.href,
+              mimeType: "application/json",
+              text: JSON.stringify(
+                {
+                  initialized: false,
+                  project_id: projectId,
                   message: msg,
                 },
                 null,

@@ -423,19 +423,60 @@ export class TaskRepository {
       .run(projectId, taskId, eventType, actor, JSON.stringify(details), now);
   }
 
+  public listProjects(): ProjectRecord[] {
+    const rows = this.dbManager.db
+      .query<RawProjectRow, []>(
+        "SELECT * FROM projects ORDER BY updated_at DESC, created_at DESC"
+      )
+      .all();
+
+    return rows.map((row) => ({
+      project_id: row.project_id,
+      project_name: row.project_name,
+      root_path: row.root_path,
+      config_path: row.config_path,
+      shared_context: parseJsonSafe<ProjectSharedContext>(row.shared_context, {}),
+      created_at: row.created_at,
+      updated_at: row.updated_at,
+    }));
+  }
+
+  public deleteProject(projectId: string): void {
+    this.dbManager.db
+      .query("DELETE FROM projects WHERE project_id = ?")
+      .run(projectId);
+  }
+
   public getTaskEvents(
     projectId: string,
     taskId: string,
     limit = 30
   ): TaskEventRecord[] {
-    const rows = this.dbManager.db
-      .query<RawEventRow, [string, string, number]>(
-        `SELECT * FROM task_events
-         WHERE project_id = ? AND task_id = ?
-         ORDER BY id DESC
-         LIMIT ?`
-      )
-      .all(projectId, taskId, limit);
+    return this.getProjectEvents(projectId, limit, taskId);
+  }
+
+  public getProjectEvents(
+    projectId: string,
+    limit = 30,
+    taskId?: string
+  ): TaskEventRecord[] {
+    const rows = taskId
+      ? this.dbManager.db
+          .query<RawEventRow, [string, string, number]>(
+            `SELECT * FROM task_events
+             WHERE project_id = ? AND task_id = ?
+             ORDER BY id DESC
+             LIMIT ?`
+          )
+          .all(projectId, taskId, limit)
+      : this.dbManager.db
+          .query<RawEventRow, [string, number]>(
+            `SELECT * FROM task_events
+             WHERE project_id = ?
+             ORDER BY id DESC
+             LIMIT ?`
+          )
+          .all(projectId, limit);
 
     return rows.map((row) => ({
       id: row.id,

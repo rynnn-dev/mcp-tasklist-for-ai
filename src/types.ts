@@ -166,6 +166,15 @@ export interface VerificationResult {
   combined_output: string;
 }
 
+export interface VerificationProgressUpdate {
+  tier: "task" | "project_default";
+  command: string;
+  step_index: number;
+  total_steps: number;
+  elapsed_ms: number;
+  phase: "start" | "tick" | "done";
+}
+
 export type TasklistErrorCode =
   | "PROJECT_NOT_INITIALIZED"
   | "PROJECT_ALREADY_INITIALIZED"

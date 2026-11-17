@@ -1,8 +1,13 @@
 import { spawn } from "node:child_process";
-import type { VerificationResult, VerificationStepResult } from "../types.ts";
+import type {
+  VerificationProgressUpdate,
+  VerificationResult,
+  VerificationStepResult,
+} from "../types.ts";
 
 export const MAX_VERIFICATION_OUTPUT_CHARS = 8192;
 const MAX_STREAM_BUFFER_CHARS = 65536;
+const DEFAULT_PROGRESS_INTERVAL_MS = 1000;
 
 export function truncateOutputTail(
   text: string,
@@ -27,12 +32,38 @@ async function runSingleCommand(
   tier: "task" | "project_default",
   command: string,
   cwd: string,
-  timeoutMs: number
+  timeoutMs: number,
+  stepIndex: number,
+  totalSteps: number,
+  onProgress?: (update: VerificationProgressUpdate) => void | Promise<void>,
+  progressIntervalMs = DEFAULT_PROGRESS_INTERVAL_MS
 ): Promise<VerificationStepResult> {
   const startedAt = Date.now();
   let timedOut = false;
   let stdoutBuf = "";
   let stderrBuf = "";
+
+  const emitProgress = (phase: "start" | "tick" | "done") => {
+    if (!onProgress) return;
+    try {
+      void Promise.resolve(
+        onProgress({
+          tier,
+          command,
+          step_index: stepIndex,
+          total_steps: totalSteps,
+          elapsed_ms: Date.now() - startedAt,
+          phase,
+        })
+      ).catch(() => {
+        // Ignore progress callback failures so verification never aborts
+      });
+    } catch {
+      // Ignore synchronous progress callback failures
+    }
+  };
+
+  emitProgress("start");
 
   return await new Promise<VerificationStepResult>((resolve) => {
     const useProcessGroup = process.platform !== "win32";
@@ -63,11 +94,16 @@ async function runSingleCommand(
     let settled = false;
     let killGraceTimer: ReturnType<typeof setTimeout> | undefined;
     let hardCloseTimer: ReturnType<typeof setTimeout> | undefined;
+    const progressTimer =
+      onProgress && progressIntervalMs > 0
+        ? setInterval(() => emitProgress("tick"), progressIntervalMs)
+        : undefined;
 
     const finish = (exitCode: number | null) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeoutTimer);
+      if (progressTimer !== undefined) clearInterval(progressTimer);
       if (killGraceTimer !== undefined) clearTimeout(killGraceTimer);
       if (hardCloseTimer !== undefined) clearTimeout(hardCloseTimer);
 
@@ -87,6 +123,8 @@ async function runSingleCommand(
 
       const combined = segments.join("\n\n");
       const passed = !timedOut && exitCode === 0;
+
+      emitProgress("done");
 
       resolve({
         tier,
@@ -143,6 +181,8 @@ export async function runVerificationGate(params: {
   taskCommand: string | null;
   defaultCommand: string | null;
   timeoutMs: number;
+  onProgress?: (update: VerificationProgressUpdate) => void | Promise<void>;
+  progressIntervalMs?: number;
 }): Promise<VerificationResult> {
   const queue: Array<{ tier: "task" | "project_default"; command: string }> = [];
 
@@ -167,12 +207,17 @@ export async function runVerificationGate(params: {
   const steps: VerificationStepResult[] = [];
   let allPassed = true;
 
-  for (const item of queue) {
+  for (let i = 0; i < queue.length; i++) {
+    const item = queue[i]!;
     const step = await runSingleCommand(
       item.tier,
       item.command,
       params.projectRoot,
-      params.timeoutMs
+      params.timeoutMs,
+      i + 1,
+      queue.length,
+      params.onProgress,
+      params.progressIntervalMs
     );
     steps.push(step);
     if (!step.passed) {

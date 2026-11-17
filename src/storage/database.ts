@@ -95,6 +95,8 @@ CREATE INDEX IF NOT EXISTS idx_task_events_project_task
   ON task_events(project_id, task_id, id);
 `;
 
+export const CURRENT_SCHEMA_VERSION = 2;
+
 export class DatabaseManager {
   public readonly dbPath: string;
   public readonly db: Database;
@@ -108,14 +110,42 @@ export class DatabaseManager {
     this.configureAndMigrate();
   }
 
+  public getSchemaVersion(): number {
+    const row = this.db
+      .query<{ user_version: number }, []>("PRAGMA user_version;")
+      .get();
+    return row?.user_version ?? 0;
+  }
+
   private configureAndMigrate(): void {
     if (this.dbPath !== ":memory:") {
       this.db.exec("PRAGMA journal_mode = WAL;");
     }
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.db.exec("PRAGMA busy_timeout = 5000;");
-    this.db.exec(SCHEMA_SQL);
-    this.ensureProjectSequenceColumn();
+
+    const currentVersion = this.getSchemaVersion();
+    if (currentVersion >= CURRENT_SCHEMA_VERSION) {
+      return;
+    }
+
+    this.withImmediateTransaction(() => {
+      const versionInTx = this.getSchemaVersion();
+
+      if (versionInTx < 1) {
+        this.db.exec(SCHEMA_SQL);
+        this.db.exec("PRAGMA user_version = 1;");
+      }
+
+      if (versionInTx < 2) {
+        this.ensureProjectSequenceColumn();
+        this.db.exec(`
+          CREATE INDEX IF NOT EXISTS idx_task_events_project_id
+            ON task_events(project_id, id DESC);
+        `);
+        this.db.exec("PRAGMA user_version = 2;");
+      }
+    });
   }
 
   /**
@@ -133,9 +163,14 @@ export class DatabaseManager {
       );
       this.db.exec(`
         UPDATE projects
-        SET last_seq_num = COALESCE(
-          (SELECT MAX(seq_num) FROM tasks WHERE tasks.project_id = projects.project_id),
-          0
+        SET last_seq_num = MAX(
+          COALESCE((SELECT MAX(seq_num) FROM tasks WHERE tasks.project_id = projects.project_id), 0),
+          COALESCE(
+            (SELECT MAX(CAST(SUBSTR(task_id, 6) AS INTEGER))
+             FROM task_events
+             WHERE task_events.project_id = projects.project_id AND task_id GLOB 'TASK-[0-9]*'),
+            0
+          )
         );
       `);
     }

@@ -25,12 +25,18 @@ Usage:
   moex [serve] [--project-dir <path>] [--config <file>]
   moex init [options]
   moex status [--dir <path>] [--config <file>] [--json]
+  moex show [<task-id> | --task <id>] [--dir <path>] [--config <file>] [--json]
+  moex logs [--dir <path>] [--config <file>] [--task <id>] [--limit <n>] [--json]
+  moex projects [--prune] [--json]
   moex unlock [--dir <path>] [--config <file>] [--task <id> | --all-stale]
 
 Subcommands:
   init      Initialize ${DEFAULT_CONFIG_FILENAME} in a target project root and register it in the central DB.
             Automatically appends the config filename to .gitignore ONLY if .gitignore exists.
   status    Print a human-readable summary of project tasks, active locks, and blockers.
+  show      Inspect full detail of a specific task including last verification output and events.
+  logs      Show audit event history for the project (or filtered by --task).
+  projects  List all registered projects in the central DB (use --prune to remove orphaned entries).
   unlock    Release stuck in_progress locks or reset a blocked/failed task back to pending.
   serve     Start the MCP stdio server (default when no subcommand is given).
 
@@ -300,6 +306,189 @@ export function runCliCommand(argv: readonly string[]): CliResult {
         console.log("No matching locked/stale tasks found to unlock.");
       } else {
         console.log(`Unlocked tasks back to pending: ${res.unlocked_task_ids.join(", ")}`);
+      }
+    } finally {
+      dbManager.close();
+    }
+
+    return { mode: "cli", exitCode: 0 };
+  }
+
+  if (subcommand === "show") {
+    const parsed = parseArgs({
+      args: subArgs,
+      options: {
+        dir: { type: "string" },
+        config: { type: "string" },
+        task: { type: "string" },
+        json: { type: "boolean" },
+        help: { type: "boolean", short: "h" },
+      },
+      strict: true,
+      allowPositionals: true,
+    });
+
+    if (parsed.values.help) {
+      printHelp();
+      return { mode: "cli", exitCode: 0 };
+    }
+
+    const taskId = parsed.values.task ?? parsed.positionals[0];
+    if (!taskId) {
+      throw new TasklistError(
+        "VALIDATION_ERROR",
+        'Usage: moex show <task-id> (or --task <id>) [--dir <path>] [--config <file>] [--json]'
+      );
+    }
+
+    const dbManager = new DatabaseManager();
+    try {
+      const repo = new TaskRepository(dbManager);
+      const scheduler = new TaskScheduler(repo);
+      const detail = scheduler.getTaskDetail(
+        parsed.values.dir ?? process.cwd(),
+        taskId,
+        parsed.values.config
+      );
+
+      if (parsed.values.json) {
+        console.log(JSON.stringify(detail, null, 2));
+        return { mode: "cli", exitCode: 0 };
+      }
+
+      const t = detail.task;
+      console.log(`${t.id} [${t.status}] (${t.priority}) — ${t.title}`);
+      console.log(`  category   : ${t.category}`);
+      console.log(`  claimed_by : ${t.claimed_by ?? "-"}`);
+      console.log(`  attempts   : ${t.attempt_count}`);
+      if (t.depends_on.length > 0) {
+        console.log(`  depends_on : ${t.depends_on.join(", ")}`);
+      }
+      if (t.affected_files.length > 0) {
+        console.log(`  affected   : ${t.affected_files.join(", ")}`);
+      }
+      if (t.modified_files.length > 0) {
+        console.log(`  modified   : ${t.modified_files.join(", ")}`);
+      }
+      if (t.blocker_reason) {
+        console.log(`  blocker    : ${t.blocker_reason}`);
+      }
+      if (t.handoff_notes) {
+        console.log(`  handoff    : ${t.handoff_notes}`);
+      }
+      if (t.last_verification_output) {
+        console.log(`  last_verification_output:\n${t.last_verification_output}`);
+      }
+    } finally {
+      dbManager.close();
+    }
+
+    return { mode: "cli", exitCode: 0 };
+  }
+
+  if (subcommand === "logs") {
+    const parsed = parseArgs({
+      args: subArgs,
+      options: {
+        dir: { type: "string" },
+        config: { type: "string" },
+        task: { type: "string" },
+        limit: { type: "string" },
+        json: { type: "boolean" },
+        help: { type: "boolean", short: "h" },
+      },
+      strict: true,
+      allowPositionals: false,
+    });
+
+    if (parsed.values.help) {
+      printHelp();
+      return { mode: "cli", exitCode: 0 };
+    }
+
+    const limit = parsePositiveInt(parsed.values.limit, "--limit") ?? 30;
+    const dbManager = new DatabaseManager();
+    try {
+      const repo = new TaskRepository(dbManager);
+      const scheduler = new TaskScheduler(repo);
+      const res = scheduler.getProjectLogs(parsed.values.dir ?? process.cwd(), {
+        taskId: parsed.values.task,
+        limit,
+        configFileName: parsed.values.config,
+      });
+
+      if (parsed.values.json) {
+        console.log(JSON.stringify(res, null, 2));
+        return { mode: "cli", exitCode: 0 };
+      }
+
+      console.log(
+        `Audit logs for ${res.project.project_name} (${res.project.project_id}) [showing ${res.events.length}]:`
+      );
+      for (const ev of res.events) {
+        console.log(
+          `  ${ev.created_at} [${ev.event_type}] task=${ev.task_id ?? "(project)"} actor=${ev.actor} details=${JSON.stringify(ev.details)}`
+        );
+      }
+    } finally {
+      dbManager.close();
+    }
+
+    return { mode: "cli", exitCode: 0 };
+  }
+
+  if (subcommand === "projects") {
+    const parsed = parseArgs({
+      args: subArgs,
+      options: {
+        prune: { type: "boolean" },
+        json: { type: "boolean" },
+        help: { type: "boolean", short: "h" },
+      },
+      strict: true,
+      allowPositionals: false,
+    });
+
+    if (parsed.values.help) {
+      printHelp();
+      return { mode: "cli", exitCode: 0 };
+    }
+
+    const dbManager = new DatabaseManager();
+    try {
+      const repo = new TaskRepository(dbManager);
+      const scheduler = new TaskScheduler(repo);
+
+      if (parsed.values.prune) {
+        const pruneRes = scheduler.pruneOrphanedProjects();
+        if (parsed.values.json) {
+          console.log(JSON.stringify(pruneRes, null, 2));
+          return { mode: "cli", exitCode: 0 };
+        }
+        console.log(
+          `Pruned ${pruneRes.removed_projects.length} orphaned project(s). Remaining: ${pruneRes.remaining_count}.`
+        );
+        for (const p of pruneRes.removed_projects) {
+          console.log(`  - removed ${p.project_name} (${p.project_id}) at ${p.root_path}`);
+        }
+        return { mode: "cli", exitCode: 0 };
+      }
+
+      const projects = scheduler.listRegisteredProjects();
+      if (parsed.values.json) {
+        console.log(JSON.stringify({ projects }, null, 2));
+        return { mode: "cli", exitCode: 0 };
+      }
+
+      if (projects.length === 0) {
+        console.log("No projects registered in central SQLite DB.");
+      } else {
+        console.log(`Registered projects (${projects.length}):`);
+        for (const p of projects) {
+          console.log(
+            `  - ${p.project_name} (${p.project_id}) [config_exists=${p.config_exists}] root=${p.root_path}`
+          );
+        }
       }
     } finally {
       dbManager.close();

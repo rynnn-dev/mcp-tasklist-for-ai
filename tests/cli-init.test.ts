@@ -217,4 +217,76 @@ describe("CLI init & per-project config", () => {
       "src/valid.ts",
     ]);
   });
+
+  test("DatabaseManager tracks PRAGMA user_version and CLI show, logs, and projects --prune work end-to-end", () => {
+    const projA = path.join(tempRoot, "cli-obs-a");
+    const projB = path.join(tempRoot, "cli-obs-b");
+    mkdirSync(projA, { recursive: true });
+    mkdirSync(projB, { recursive: true });
+
+    const entrypoint = path.resolve(import.meta.dir, "../src/index.ts");
+
+    Bun.spawnSync({
+      cmd: ["bun", "run", entrypoint, "init", "--dir", projA, "--name", "obs-a"],
+      env: process.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    Bun.spawnSync({
+      cmd: ["bun", "run", entrypoint, "init", "--dir", projB, "--name", "obs-b"],
+      env: process.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+
+    const dbManager = new DatabaseManager();
+    expect(dbManager.getSchemaVersion()).toBe(2);
+    const repo = new TaskRepository(dbManager);
+    const resolvedA = resolveProjectConfig(projA);
+    dbManager.close();
+
+    // Create a task in projA via scheduler
+    const db2 = new DatabaseManager();
+    const { TaskScheduler } = require("../src/domain/scheduler.ts") as typeof import("../src/domain/scheduler.ts");
+    const scheduler = new TaskScheduler(new TaskRepository(db2));
+    scheduler.createTasksBatch(projA, [{ title: "Inspectable task", priority: "high" }]);
+    db2.close();
+
+    const showProc = Bun.spawnSync({
+      cmd: ["bun", "run", entrypoint, "show", "TASK-1", "--dir", projA, "--json"],
+      env: process.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(showProc.exitCode).toBe(0);
+    const showJson = JSON.parse(showProc.stdout.toString());
+    expect(showJson.task.id).toBe("TASK-1");
+    expect(showJson.task.title).toBe("Inspectable task");
+
+    const logsProc = Bun.spawnSync({
+      cmd: ["bun", "run", entrypoint, "logs", "--dir", projA, "--limit", "10", "--json"],
+      env: process.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(logsProc.exitCode).toBe(0);
+    const logsJson = JSON.parse(logsProc.stdout.toString());
+    expect(logsJson.project.project_id).toBe(resolvedA.config.project_id);
+    expect(logsJson.events.length).toBeGreaterThanOrEqual(1);
+
+    // Delete projB directory so it becomes orphaned, then prune via `moex projects --prune`
+    rmSync(projB, { recursive: true, force: true });
+    const pruneProc = Bun.spawnSync({
+      cmd: ["bun", "run", entrypoint, "projects", "--prune", "--json"],
+      env: process.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(pruneProc.exitCode).toBe(0);
+    const pruneJson = JSON.parse(pruneProc.stdout.toString());
+    expect(pruneJson.removed_projects.length).toBe(1);
+    expect(pruneJson.removed_projects[0].project_name).toBe("obs-b");
+    expect(pruneJson.remaining_count).toBe(1);
+    expect(repo).toBeDefined();
+  });
 });

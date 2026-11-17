@@ -251,4 +251,145 @@ describe("MCP Server Protocol E2E", () => {
       await client.close();
     }
   });
+
+  test("supports release_claim handoff, ResourceTemplate by project_id, static resource fallback, and notifications/progress", async () => {
+    const projDir = path.join(tempRoot, "template-proj");
+    mkdirSync(projDir, { recursive: true });
+    const init = initProjectConfig({
+      dir: projDir,
+      projectName: "template-proj",
+    });
+
+    const dbManager = new DatabaseManager(path.join(tempRoot, "central.db"));
+    const scheduler = new TaskScheduler(new TaskRepository(dbManager));
+    // Intentionally omit defaults.projectDir so static resource fallback is exercised
+    const server = createTasklistMcpServer(scheduler);
+    const client = new Client({ name: "template-client", version: "1.0.0" });
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([
+      server.connect(serverTransport),
+      client.connect(clientTransport),
+    ]);
+
+    try {
+      await client.callTool({
+        name: "set_project_context",
+        arguments: {
+          project_path: projDir,
+          architecture_summary: "Event-driven worker",
+        },
+      });
+
+      await client.callTool({
+        name: "create_tasks",
+        arguments: {
+          project_path: projDir,
+          tasks: [
+            {
+              title: "Long verification task",
+              verification_command: "sleep 0.15 && echo 'verified'",
+            },
+          ],
+        },
+      });
+
+      const claimed = parseToolText(
+        (await client.callTool({
+          name: "claim_next_task",
+          arguments: { project_path: projDir, agent_id: "worker-a" },
+        })) as any
+      );
+      expect(claimed.task.id).toBe("TASK-1");
+
+      // Release claim cleanly for handoff
+      const released = parseToolText(
+        (await client.callTool({
+          name: "update_task",
+          arguments: {
+            project_path: projDir,
+            task_id: "TASK-1",
+            agent_id: "worker-a",
+            release_claim: true,
+            handoff_notes: "Handing off to worker-b",
+          },
+        })) as any
+      );
+      expect(released.status).toBe("pending");
+      expect(released.claimed_by).toBeNull();
+
+      // Re-claim as worker-b
+      const reclaimed = parseToolText(
+        (await client.callTool({
+          name: "claim_next_task",
+          arguments: { project_path: projDir, agent_id: "worker-b" },
+        })) as any
+      );
+      expect(reclaimed.task.claimed_by).toBe("worker-b");
+      expect(reclaimed.task.handoff_notes).toBe("Handing off to worker-b");
+
+      // Complete with onprogress to capture notifications/progress
+      const progressEvents: Array<{ progress: number; total?: number; message?: string }> = [];
+      const done = parseToolText(
+        (await client.callTool(
+          {
+            name: "complete_task",
+            arguments: {
+              project_path: projDir,
+              task_id: "TASK-1",
+              agent_id: "worker-b",
+              verification_note: "Passed with progress stream",
+            },
+          },
+          undefined,
+          {
+            onprogress: (p) => {
+              progressEvents.push(p);
+            },
+          }
+        )) as any
+      );
+      expect(done.task.status).toBe("done");
+      expect(progressEvents.length).toBeGreaterThanOrEqual(2);
+
+      // Verify ResourceTemplates list & read by project_id
+      const templates = await client.listResourceTemplates();
+      expect(templates.resourceTemplates.map((t) => t.uriTemplate).sort()).toEqual([
+        "moex://projects/{project_id}/context",
+        "moex://projects/{project_id}/summary",
+      ]);
+
+      const byIdSummary = await client.readResource({
+        uri: `moex://projects/${init.config.project_id}/summary`,
+      });
+      const parsedById = JSON.parse(
+        (byIdSummary.contents[0] as { text: string }).text
+      );
+      expect(parsedById.counts.done).toBe(1);
+      expect(parsedById.recent_events.length).toBeGreaterThanOrEqual(1);
+
+      const byIdContext = await client.readResource({
+        uri: `moex://projects/${init.config.project_id}/context`,
+      });
+      const parsedCtx = JSON.parse(
+        (byIdContext.contents[0] as { text: string }).text
+      );
+      expect(parsedCtx.project.shared_context.architecture_summary).toBe(
+        "Event-driven worker"
+      );
+
+      // Verify static resource fallback works even without defaults.projectDir
+      const fallbackSummary = await client.readResource({
+        uri: "moex://project/summary",
+      });
+      const parsedFallback = JSON.parse(
+        (fallbackSummary.contents[0] as { text: string }).text
+      );
+      expect(parsedFallback.project.project_id).toBe(init.config.project_id);
+    } finally {
+      await client.close();
+      await server.close();
+      dbManager.close();
+    }
+  });
 });
