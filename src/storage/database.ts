@@ -31,6 +31,7 @@ CREATE TABLE IF NOT EXISTS projects (
   root_path TEXT NOT NULL,
   config_path TEXT NOT NULL,
   shared_context TEXT NOT NULL DEFAULT '{}',
+  last_seq_num INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -114,6 +115,30 @@ export class DatabaseManager {
     this.db.exec("PRAGMA foreign_keys = ON;");
     this.db.exec("PRAGMA busy_timeout = 5000;");
     this.db.exec(SCHEMA_SQL);
+    this.ensureProjectSequenceColumn();
+  }
+
+  /**
+   * Ensures existing databases created prior to monotonic sequence tracking
+   * receive the projects.last_seq_num column and backfill their high-water mark.
+   */
+  private ensureProjectSequenceColumn(): void {
+    const columns = this.db
+      .query<{ name: string }, []>("PRAGMA table_info(projects)")
+      .all();
+    const hasLastSeqNum = columns.some((c) => c.name === "last_seq_num");
+    if (!hasLastSeqNum) {
+      this.db.exec(
+        "ALTER TABLE projects ADD COLUMN last_seq_num INTEGER NOT NULL DEFAULT 0;"
+      );
+      this.db.exec(`
+        UPDATE projects
+        SET last_seq_num = COALESCE(
+          (SELECT MAX(seq_num) FROM tasks WHERE tasks.project_id = projects.project_id),
+          0
+        );
+      `);
+    }
   }
 
   /**

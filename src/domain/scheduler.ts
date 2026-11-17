@@ -370,6 +370,13 @@ export class TaskScheduler {
         });
       }
 
+      if (prepared.length > 0) {
+        this.repo.advanceProjectSeqNum(
+          projectId,
+          prepared[prepared.length - 1]!.seq_num
+        );
+      }
+
       for (const edge of newEdges) {
         this.repo.addDependency(projectId, edge.task_id, edge.depends_on_task_id);
       }
@@ -770,9 +777,12 @@ export class TaskScheduler {
     projectPath: string | undefined,
     taskId: string,
     patch: UpdateTaskPatch,
-    actor = "agent",
+    actor?: string,
     configFileName?: string
   ): TaskRecord {
+    const explicitActor = actor?.trim();
+    const effectiveActor = explicitActor || "agent";
+
     return this.repo.withTransaction(() => {
       const { resolved } = this.resolveAndSync(projectPath, configFileName);
       const projectId = resolved.config.project_id;
@@ -781,6 +791,19 @@ export class TaskScheduler {
         throw new TasklistError(
           "TASK_NOT_FOUND",
           `Task "${taskId}" not found in project "${resolved.config.project_name}".`
+        );
+      }
+
+      if (
+        !patch.reset_to_pending &&
+        existing.status === "in_progress" &&
+        existing.claimed_by &&
+        explicitActor &&
+        existing.claimed_by !== explicitActor
+      ) {
+        throw new TasklistError(
+          "TASK_LOCKED",
+          `Task "${taskId}" is currently claimed by "${existing.claimed_by}", not "${explicitActor}". Pass reset_to_pending=true only if intentionally overriding a stuck claim.`
         );
       }
 
@@ -902,7 +925,7 @@ export class TaskScheduler {
       }
 
       this.repo.updateTaskRow(projectId, taskId, updateFields);
-      this.repo.recordEvent(projectId, taskId, "TASK_UPDATED", actor, {
+      this.repo.recordEvent(projectId, taskId, "TASK_UPDATED", effectiveActor, {
         reset_to_pending: patch.reset_to_pending ?? false,
         heartbeat: patch.heartbeat ?? false,
       });
@@ -917,7 +940,8 @@ export class TaskScheduler {
     params: CompleteTaskParams,
     configFileName?: string
   ): Promise<CompleteTaskResult> {
-    const actor = params.agent_id?.trim() || "agent";
+    const cleanAgentId = params.agent_id?.trim();
+    const actor = cleanAgentId || "agent";
 
     // Phase 1: Validate preconditions inside immediate transaction (no subprocess yet)
     const preflight = this.repo.withTransaction(() => {
@@ -941,16 +965,13 @@ export class TaskScheduler {
         );
       }
 
-      if (
-        task.status === "in_progress" &&
-        params.agent_id?.trim() &&
-        task.claimed_by &&
-        task.claimed_by !== params.agent_id.trim()
-      ) {
-        throw new TasklistError(
-          "TASK_LOCKED",
-          `Task "${taskId}" is currently claimed by "${task.claimed_by}", not "${params.agent_id.trim()}".`
-        );
+      if (task.status === "in_progress" && task.claimed_by) {
+        if (!cleanAgentId || task.claimed_by !== cleanAgentId) {
+          throw new TasklistError(
+            "TASK_LOCKED",
+            `Task "${taskId}" is currently claimed by "${task.claimed_by}", not "${cleanAgentId ?? "(unspecified)"}".`
+          );
+        }
       }
 
       const unfinishedDeps = task.depends_on.filter(
@@ -990,6 +1011,9 @@ export class TaskScheduler {
       return {
         resolved,
         task,
+        expectedStatus: task.status,
+        expectedClaimedBy: task.claimed_by,
+        expectedClaimedAt: task.claimed_at,
         verificationNote,
         normalizedModified,
       };
@@ -1020,17 +1044,41 @@ export class TaskScheduler {
       { kind: "failed"; error: TasklistError } | { kind: "ok"; result: CompleteTaskResult }
     >(() => {
       const projectId = preflight.resolved.config.project_id;
-      const currentTask = this.repo.getTaskById(projectId, taskId);
+      const allTasksNow = this.repo.listTasksByProject(projectId);
+      const taskMapNow = new Map(allTasksNow.map((t) => [t.id, t]));
+      const currentTask = taskMapNow.get(taskId);
+
       if (!currentTask) {
         throw new TasklistError(
           "TASK_NOT_FOUND",
           `Task "${taskId}" was deleted while verification was running.`
         );
       }
-      if (currentTask.status !== "in_progress" && currentTask.status !== "pending") {
+
+      if (currentTask.status !== preflight.expectedStatus) {
         throw new TasklistError(
           "INVALID_STATE_TRANSITION",
-          `Task "${taskId}" changed to "${currentTask.status}" while verification was running.`
+          `Task "${taskId}" status changed from "${preflight.expectedStatus}" to "${currentTask.status}" while verification was running (e.g. suspended by an injected prerequisite or unlocked).`
+        );
+      }
+
+      if (
+        currentTask.claimed_by !== preflight.expectedClaimedBy ||
+        currentTask.claimed_at !== preflight.expectedClaimedAt
+      ) {
+        throw new TasklistError(
+          "TASK_LOCKED",
+          `Task "${taskId}" lock ownership changed while verification was running (expected "${preflight.expectedClaimedBy ?? "none"}", found "${currentTask.claimed_by ?? "none"}").`
+        );
+      }
+
+      const unfinishedDepsNow = currentTask.depends_on.filter(
+        (depId) => taskMapNow.get(depId)?.status !== "done"
+      );
+      if (unfinishedDepsNow.length > 0) {
+        throw new TasklistError(
+          "INVALID_STATE_TRANSITION",
+          `Task "${taskId}" acquired unfinished prerequisite(s) while verification was running: ${unfinishedDepsNow.join(", ")}.`
         );
       }
 
@@ -1143,7 +1191,8 @@ export class TaskScheduler {
     params: BlockOrFailParams,
     configFileName?: string
   ): TaskRecord {
-    const actor = params.agent_id?.trim() || "agent";
+    const cleanAgentId = params.agent_id?.trim();
+    const actor = cleanAgentId || "agent";
     const reason = params.reason.trim();
     if (!reason) {
       throw new TasklistError(
@@ -1166,6 +1215,17 @@ export class TaskScheduler {
         throw new TasklistError(
           "INVALID_STATE_TRANSITION",
           `Task "${taskId}" is already done. Use update_task(reset_to_pending=true) to reopen it.`
+        );
+      }
+      if (
+        existing.status === "in_progress" &&
+        existing.claimed_by &&
+        cleanAgentId &&
+        existing.claimed_by !== cleanAgentId
+      ) {
+        throw new TasklistError(
+          "TASK_LOCKED",
+          `Task "${taskId}" is currently claimed by "${existing.claimed_by}", not "${cleanAgentId}".`
         );
       }
 
@@ -1240,6 +1300,13 @@ export class TaskScheduler {
         throw new TasklistError(
           "TASK_NOT_FOUND",
           `Task "${taskId}" not found in project "${resolved.config.project_name}".`
+        );
+      }
+
+      if (existing.status === "in_progress" && !force) {
+        throw new TasklistError(
+          "TASK_LOCKED",
+          `Cannot delete "${taskId}" while it is in_progress (claimed by "${existing.claimed_by ?? "unknown"}"). Pass force=true to override.`
         );
       }
 

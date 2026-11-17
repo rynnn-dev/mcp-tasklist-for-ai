@@ -311,6 +311,10 @@ export function createTasklistMcpServer(
         project_path: z.string().optional(),
         config_file: z.string().optional(),
         task_id: z.string().min(1),
+        agent_id: z
+          .string()
+          .optional()
+          .describe("Identifier of the agent performing the update (validated against claimed_by on active tasks)."),
         actor: z.string().optional(),
         title: z.string().optional(),
         description: z.string().optional(),
@@ -357,7 +361,7 @@ export function createTasklistMcpServer(
             add_depends_on: args.add_depends_on,
             remove_depends_on: args.remove_depends_on,
           },
-          args.actor,
+          args.agent_id ?? args.actor,
           resolveCfg(args.config_file)
         )
       )

@@ -253,5 +253,16 @@ describe("Scheduler DAG, isolation, shared context, and dynamic task splitting",
     expect(res.deleted_task_id).toBe("TASK-1");
     expect(res.unlinked_dependents).toEqual(["TASK-2"]);
     expect(scheduler.getTaskDetail(projDir, "TASK-2").task.depends_on).toEqual([]);
+
+    // Deleting the highest task (TASK-2) must NOT cause the next created task to reuse TASK-2
+    scheduler.deleteTask(projDir, "TASK-2", false);
+    const nextBatch = scheduler.createTasksBatch(projDir, [
+      { title: "Fresh task after deletion" },
+    ]);
+    expect(nextBatch.tasks[0]?.id).toBe("TASK-3");
+    expect(nextBatch.tasks[0]?.seq_num).toBe(3);
+
+    const detail3 = scheduler.getTaskDetail(projDir, "TASK-3");
+    expect(detail3.events.every((e) => e.event_type !== "TASK_DELETED")).toBe(true);
   });
 });

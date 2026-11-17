@@ -140,11 +140,30 @@ export class TaskRepository {
 
   public getNextSeqNum(projectId: string): number {
     const row = this.dbManager.db
-      .query<{ max_seq: number | null }, [string]>(
-        "SELECT MAX(seq_num) as max_seq FROM tasks WHERE project_id = ?"
+      .query<{ high_water: number }, [string, string, string]>(
+        `SELECT MAX(
+          COALESCE((SELECT last_seq_num FROM projects WHERE project_id = ?), 0),
+          COALESCE((SELECT MAX(seq_num) FROM tasks WHERE project_id = ?), 0),
+          COALESCE(
+            (SELECT MAX(CAST(SUBSTR(task_id, 6) AS INTEGER))
+             FROM task_events
+             WHERE project_id = ? AND task_id GLOB 'TASK-[0-9]*'),
+            0
+          )
+        ) AS high_water`
       )
-      .get(projectId);
-    return (row?.max_seq ?? 0) + 1;
+      .get(projectId, projectId, projectId);
+    return (row?.high_water ?? 0) + 1;
+  }
+
+  public advanceProjectSeqNum(projectId: string, lastSeqNum: number): void {
+    this.dbManager.db
+      .query(
+        `UPDATE projects
+         SET last_seq_num = MAX(last_seq_num, ?)
+         WHERE project_id = ?`
+      )
+      .run(lastSeqNum, projectId);
   }
 
   public insertTask(task: Omit<TaskRecord, "depends_on">): void {

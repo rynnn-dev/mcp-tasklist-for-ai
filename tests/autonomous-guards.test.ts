@@ -253,4 +253,136 @@ describe("Autonomous Guardrails: Active Verification Gate, Stale Recovery, & Fil
     const finalState = scheduler.claimNextTask(projDir, "worker-1");
     expect(finalState.outcome).toBe("PROJECT_COMPLETED");
   });
+
+  test("completeTask Phase 3 detects TOCTOU race when task is suspended or reclaimed while verification runs", async () => {
+    const projDir = path.join(tempRoot, "toctou-proj");
+    mkdirSync(projDir, { recursive: true });
+    initProjectConfig({ dir: projDir, projectName: "toctou-proj" });
+
+    scheduler.createTasksBatch(projDir, [
+      {
+        title: "Slow verification task",
+        verification_command: "sleep 0.25 && echo 'slow pass'",
+      },
+      {
+        title: "Second slow verification task",
+        verification_command: "sleep 0.25 && echo 'slow pass 2'",
+      },
+    ]);
+
+    // 1. Subagent A starts completing TASK-1, while Subagent B injects a prerequisite mid-verification
+    const c1 = scheduler.claimNextTask(projDir, "agent-a");
+    expect(c1.task?.id).toBe("TASK-1");
+
+    const completionPromise = scheduler.completeTask(projDir, "TASK-1", {
+      agent_id: "agent-a",
+      verification_note: "Finished work before prerequisite was discovered",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    scheduler.createTasksBatch(projDir, [
+      {
+        title: "Injected prerequisite during verification",
+        blocks_task_ids: ["TASK-1"],
+      },
+    ]);
+
+    try {
+      await completionPromise;
+      expect.unreachable("Expected completeTask Phase 3 to reject suspended task");
+    } catch (err) {
+      expect(err).toBeInstanceOf(TasklistError);
+      expect((err as TasklistError).code).toBe("INVALID_STATE_TRANSITION");
+    }
+
+    const detailAfterSuspend = scheduler.getTaskDetail(projDir, "TASK-1");
+    expect(detailAfterSuspend.task.status).toBe("pending");
+    expect(detailAfterSuspend.task.claimed_by).toBeNull();
+
+    // 2. Subagent A claims TASK-2 and runs verification, while operator unlocks & Subagent B claims it
+    const c2 = scheduler.claimNextTask(projDir, "agent-a", {
+      prefer_task_id: "TASK-2",
+    });
+    expect(c2.task?.id).toBe("TASK-2");
+
+    const hijackPromise = scheduler.completeTask(projDir, "TASK-2", {
+      agent_id: "agent-a",
+      verification_note: "Trying to complete after losing lock",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    scheduler.unlockTasks(projDir, { taskId: "TASK-2" });
+    const reclaimedByB = scheduler.claimNextTask(projDir, "agent-b", {
+      prefer_task_id: "TASK-2",
+    });
+    expect(reclaimedByB.task?.id).toBe("TASK-2");
+    expect(reclaimedByB.task?.claimed_by).toBe("agent-b");
+
+    try {
+      await hijackPromise;
+      expect.unreachable("Expected completeTask Phase 3 to reject hijacked lock");
+    } catch (err) {
+      expect(err).toBeInstanceOf(TasklistError);
+      expect((err as TasklistError).code).toBe("TASK_LOCKED");
+    }
+
+    const detailAfterHijack = scheduler.getTaskDetail(projDir, "TASK-2");
+    expect(detailAfterHijack.task.status).toBe("in_progress");
+    expect(detailAfterHijack.task.claimed_by).toBe("agent-b");
+  });
+
+  test("enforces lock ownership across updateTask, blockOrFailTask, completeTask, and deleteTask", async () => {
+    const projDir = path.join(tempRoot, "ownership-proj");
+    mkdirSync(projDir, { recursive: true });
+    initProjectConfig({ dir: projDir, projectName: "ownership-proj" });
+
+    scheduler.createTasksBatch(projDir, [{ title: "Owned task" }]);
+    const claim = scheduler.claimNextTask(projDir, "owner-agent");
+    expect(claim.task?.id).toBe("TASK-1");
+
+    // Wrong agent cannot update task (unless reset_to_pending=true)
+    expect(() =>
+      scheduler.updateTask(
+        projDir,
+        "TASK-1",
+        { handoff_notes: "Intruder note" },
+        "intruder-agent"
+      )
+    ).toThrow(TasklistError);
+
+    // Wrong agent cannot block/fail task
+    expect(() =>
+      scheduler.blockOrFailTask(projDir, "TASK-1", {
+        agent_id: "intruder-agent",
+        outcome: "failed",
+        reason: "Intruder failure",
+      })
+    ).toThrow(TasklistError);
+
+    // Missing or wrong agent_id cannot complete claimed in_progress task
+    await expect(
+      scheduler.completeTask(projDir, "TASK-1", {
+        verification_note: "Missing agent_id",
+      })
+    ).rejects.toThrow(TasklistError);
+
+    await expect(
+      scheduler.completeTask(projDir, "TASK-1", {
+        agent_id: "intruder-agent",
+        verification_note: "Wrong agent_id",
+      })
+    ).rejects.toThrow(TasklistError);
+
+    // Active in_progress task cannot be deleted without force=true
+    expect(() => scheduler.deleteTask(projDir, "TASK-1", false)).toThrow(
+      TasklistError
+    );
+
+    // Owner can complete cleanly
+    const done = await scheduler.completeTask(projDir, "TASK-1", {
+      agent_id: "owner-agent",
+      verification_note: "Completed by valid owner",
+    });
+    expect(done.task.status).toBe("done");
+  });
 });
