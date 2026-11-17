@@ -10,7 +10,7 @@ Aplikasi ini berfungsi sebagai *stateful autonomous orchestrator & guardrails* a
 1. **Database Terpusat (`tasklist.db`):**
    - Lokasi default: `$XDG_DATA_HOME/moex/tasklist.db` (fallback `~/.local/share/moex/tasklist.db`).
    - Dapat di-override melalui environment variable `MOEX_DB_PATH` (dengan fallback `MCP_TASKLIST_DB_PATH`).
-   - Engine: `bun:sqlite` dengan `PRAGMA journal_mode = WAL`, `PRAGMA foreign_keys = ON`, dan `PRAGMA busy_timeout = 5000`.
+   - Engine: `bun:sqlite` dengan `PRAGMA busy_timeout = 5000`, `PRAGMA journal_mode = WAL`, `PRAGMA foreign_keys = ON`, dan migrasi berurut via `PRAGMA user_version = 3`.
 2. **Konfigurasi Lokal Per-Proyek (`.moex.json`):**
    - Wajib diinisialisasi per proyek di root direktori melalui CLI terminal `moex init` (dilarang auto-init global secara diam-diam).
    - Apabila file `.gitignore` sudah ada di root proyek saat `init`, entry nama file konfigurasi (`.moex.json`) ditambahkan secara idempotent. Jika `.gitignore` tidak ada, tidak dibuatkan file `.gitignore` baru.
@@ -44,6 +44,7 @@ Aplikasi ini berfungsi sebagai *stateful autonomous orchestrator & guardrails* a
    - `root_path TEXT NOT NULL`
    - `config_path TEXT NOT NULL`
    - `shared_context TEXT NOT NULL DEFAULT '{}'` (JSON: `architecture_summary`, `conventions`, `shared_contracts`, `tech_stack`, `notes`)
+   - `last_seq_num INTEGER NOT NULL DEFAULT 0` (high-water mark monotonik `seq_num` per proyek)
    - `created_at TEXT NOT NULL`
    - `updated_at TEXT NOT NULL`
 2. **`tasks`**
@@ -57,7 +58,7 @@ Aplikasi ini berfungsi sebagai *stateful autonomous orchestrator & guardrails* a
    - `priority TEXT NOT NULL` (`critical` | `high` | `medium` | `low`)
    - `acceptance_criteria TEXT NOT NULL DEFAULT '[]'` (JSON string[])
    - `verification_command TEXT` (nullable)
-   - `affected_files TEXT NOT NULL DEFAULT '[]'` (JSON string[] — relative POSIX path)
+   - `affected_files TEXT NOT NULL DEFAULT '[]'` (JSON string[] — relative POSIX path/dir/glob)
    - `modified_files TEXT NOT NULL DEFAULT '[]'` (JSON string[] — relative POSIX path)
    - `handoff_notes TEXT NOT NULL DEFAULT ''`
    - `verification_note TEXT NOT NULL DEFAULT ''`
@@ -65,6 +66,7 @@ Aplikasi ini berfungsi sebagai *stateful autonomous orchestrator & guardrails* a
    - `claimed_by TEXT` (nullable)
    - `claimed_at TEXT` (nullable)
    - `heartbeat_at TEXT` (nullable)
+   - `lock_version INTEGER NOT NULL DEFAULT 0` (token optimistik monotonik pada klaim/reclaim/unlock untuk guard TOCTOU & ownership)
    - `attempt_count INTEGER NOT NULL DEFAULT 0`
    - `blocker_reason TEXT NOT NULL DEFAULT ''`
    - `created_at TEXT NOT NULL`
@@ -97,11 +99,13 @@ Aplikasi ini berfungsi sebagai *stateful autonomous orchestrator & guardrails* a
 3. **Smart Atomic Claiming (`claim_next_task`):**
    - Transaksi `BEGIN IMMEDIATE` untuk mencegah *double-claim* antar subagent paralel.
    - **Stale Lease Recovery:** Task `in_progress` yang melewati `lease_timeout_minutes` (berdasarkan `heartbeat_at` atau `claimed_at`) otomatis direclaim (`attempt_count + 1`). Jika `attempt_count >= max_attempts`, status berubah ke `failed`; jika belum, task kembali ke antrean kandidat dengan mewarisi `handoff_notes` lama.
-   - **File Scope Conflict Detection:** Kandidat `pending` yang `affected_files`-nya beririsan dengan `affected_files ∪ modified_files` milik task lain yang sedang `in_progress` aktif akan di-skip sementara (kecuali `ignore_file_locks: true`).
+   - **Strict Lock Ownership (`update_task`, `block_or_fail_task`, `complete_task`):** Saat task berstatus `in_progress` dengan `claimed_by` aktif, mutasi mewajibkan `agent_id` (atau `actor` untuk `update_task`) yang cocok tepat dengan `claimed_by` (ditolak dengan `TASK_LOCKED` jika kosong atau berbeda, kecuali `update_task(..., reset_to_pending=true)`).
+   - **File Scope Conflict Detection:** Kandidat `pending` yang `affected_files`-nya beririsan (eksak, hirarki direktori, maupun wildcard glob) dengan `affected_files ∪ modified_files` milik task lain yang sedang `in_progress` aktif akan di-skip sementara (kecuali `ignore_file_locks: true`).
    - **Context Hydration:** Mengembalikan detail task + `project_shared_context` + `prerequisite_handoffs`.
    - **Strict Queue Outcomes:** `TASK_CLAIMED`, `WAITING_ON_ACTIVE_TASKS`, `BLOCKED_BY_FAILURES`, `PROJECT_COMPLETED`, atau `NO_TASKS_PLANNED`.
 4. **Active Verification Gate (`complete_task`):**
-   - Menjalankan command verifikasi secara two-tier jika `auto_run_verification` aktif dan command tersedia: task-level `verification_command` (bila ada) dan `default_verification_command` proyek (wajib sebagai baseline, tidak dapat di-bypass oleh agent).
+   - Wajib berstatus `in_progress` (klaim via `claim_next_task`) dan memvalidasi ownership `claimed_by`, snapshot `lock_version` (`TASK_LOCKED`), serta integritas command/config (`INVALID_STATE_TRANSITION`) di Fase 3 pasca-verifikasi.
+   - Menjalankan command verifikasi secara two-tier jika `auto_run_verification` aktif dan command tersedia: task-level `verification_command` (bila ada) dan `default_verification_command` proyek (wajib sebagai baseline, tidak dapat di-bypass oleh agent), sambil menyegarkan `heartbeat_at` dan memancarkan `notifications/progress`.
    - Output `stdout`/`stderr` dibatasi (*tail truncation*) maksimal `8192` karakter; timeout ditegakkan sesuai `verification_timeout_ms`.
    - Jika gagal (`exitCode !== 0` atau `timedOut`): `attempt_count` bertambah `+1`. Jika `attempt_count >= max_attempts`, status menjadi `failed` dan lock dilepas; jika masih di bawah batas, status tetap `in_progress` agar agent dapat memperbaiki lalu mencoba lagi.
 
@@ -111,9 +115,12 @@ Aplikasi ini berfungsi sebagai *stateful autonomous orchestrator & guardrails* a
 - **CLI Subcommands (`moex`):**
   - `moex init [--dir <path>] [--name <name>] [--config <file>] [--verify-cmd <cmd>] [--no-auto-verify] [--verify-timeout <ms>] [--max-attempts <n>] [--lease-minutes <n>] [--no-require-note] [--new] [--force]`
   - `moex status [--dir <path>] [--config <file>] [--json]`
-  - `moex unlock [--dir <path>] [--config <file>] [--task <id> | --all-stale]`
+  - `moex show [<task-id> | --task <id>] [--dir <path>] [--config <file>] [--json]`
+  - `moex logs [--dir <path>] [--config <file>] [--task <id>] [--limit <n>] [--json]`
+  - `moex projects [--prune] [--json]`
+  - `moex unlock [--dir <path>] [--config <file>] (--task <id> | --all-stale | --all) [--json]`
   - `moex serve [--project-dir <path>] [--config <file>]` (default jika tanpa subcommand)
   - `moex --version` / `-v`
 - **10 MCP Tools:** `set_project_context`, `create_tasks`, `list_tasks`, `get_task_detail`, `claim_next_task`, `update_task`, `complete_task`, `block_or_fail_task`, `delete_task`, `get_project_summary`.
-- **2 MCP Resources:** `moex://project/summary`, `moex://project/context`.
+- **2 MCP Resources & 2 ResourceTemplates:** `moex://project/summary`, `moex://project/context`, `moex://projects/{project_id}/summary`, `moex://projects/{project_id}/context`.
 - **1 MCP Prompt:** `autonomous-workflow`.

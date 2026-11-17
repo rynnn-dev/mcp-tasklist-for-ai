@@ -14,12 +14,12 @@
 
 ### 1b. Batasan Ruang Lingkup
 - **In Scope:**
-  - CLI terminal (`moex init`, `moex status`, `moex unlock`, `moex serve`, `moex --version`) dengan penanganan idempotent `.gitignore` (hanya meng-update `.gitignore` jika file tersebut sudah ada di root proyek).
+  - CLI terminal (`moex init`, `moex status`, `moex show`, `moex logs`, `moex projects`, `moex unlock`, `moex serve`, `moex --version`) dengan penanganan idempotent `.gitignore` (hanya meng-update `.gitignore` jika file tersebut sudah ada di root proyek).
   - Penyimpanan SQLite terpusat (`$XDG_DATA_HOME/moex/tasklist.db` atau `~/.local/share/moex/tasklist.db`, override via `MOEX_DB_PATH` / fallback `MCP_TASKLIST_DB_PATH`).
   - Engine DAG (3-color DFS cycle detection + topological execution waves) & *Dynamic Task Splitting* (`blocks_task_ids`).
-  - *Smart Atomic Claiming* (`BEGIN IMMEDIATE`, stale lease recovery, file scope conflict detection, context hydration, dan 5 strict queue outcomes).
+  - *Smart Atomic Claiming* (`BEGIN IMMEDIATE`, stale lease recovery, file scope conflict detection, context hydration, strict lock ownership, dan 5 strict queue outcomes).
   - *Active Verification Gate* dua tingkat (task `verification_command` + project `default_verification_command`) dengan isolasi process group dan batas timeout.
-  - 10 MCP Tools, 2 MCP Resources (`moex://project/*`), dan 1 MCP Prompt (`autonomous-workflow`) melalui transport `stdio`.
+  - 10 MCP Tools, 2 MCP Resources (`moex://project/*`) & 2 ResourceTemplates (`moex://projects/{project_id}/*`), dan 1 MCP Prompt (`autonomous-workflow`) melalui transport `stdio`.
   - Multi-stage `Dockerfile` (`moex:latest`) + `.dockerignore` + bash installer [`scripts/install.sh`](file:///home/user/Desktop/mcp-tasklist-for-ai/scripts/install.sh).
 - **Out of Scope:**
   - Transport jaringan jarak jauh (HTTP/SSE multi-tenant cloud) dan autentikasi OAuth eksternal.
@@ -45,7 +45,7 @@
 | Nama Tabel | Engine / Schema | Peran dalam Modul | Status |
 | :--- | :--- | :--- | :--- |
 | `projects` | SQLite (`bun:sqlite` WAL) | Menyimpan metadata proyek terdaftar dan `shared_context` (blueprint arsitektur & konvensi global) | Terimplementasi |
-| `tasks` | SQLite (`bun:sqlite` WAL) | Menyimpan state lifecycle task, kriteria, command verifikasi, file scope, lock lease, dan handoff notes | Terimplementasi |
+| `tasks` | SQLite (`bun:sqlite` WAL) | Menyimpan state lifecycle task, kriteria, command verifikasi, file scope, lock lease (`lock_version`), dan handoff notes | Terimplementasi |
 | `task_dependencies` | SQLite (`bun:sqlite` WAL) | Menyimpan edge DAG (`task_id` bergantung pada `depends_on_task_id`) per `project_id` | Terimplementasi |
 | `task_events` | SQLite (`bun:sqlite` WAL) | Menyimpan jejak audit (created, claimed, suspended, verification_failed, completed, unlocked) | Terimplementasi |
 
@@ -54,32 +54,34 @@
 | :--- | :--- | :---: | :--- | :--- |
 | `projects.project_id` | `TEXT` | NO | PK | UUID v4 dari `.moex.json` proyek |
 | `projects.shared_context` | `TEXT` | NO | `'{}'` | JSON (`architecture_summary`, `tech_stack`, `conventions`, `shared_contracts`, `notes`) |
+| `projects.last_seq_num` | `INTEGER` | NO | `0` | High-water mark monotonik `seq_num` proyek (anti-tabrakan ID pasca `delete_task`) |
 | `tasks.(project_id, id)` | `TEXT, TEXT` | NO | PK | Composite PK (`project_id` + `TASK-<seq_num>`) |
 | `tasks.seq_num` | `INTEGER` | NO | - | `UNIQUE(project_id, seq_num)` untuk urutan deterministik |
 | `tasks.status` | `TEXT` | NO | `'pending'` | `CHECK (status IN ('pending','in_progress','done','blocked','failed'))` |
 | `tasks.priority` | `TEXT` | NO | `'medium'` | `CHECK (priority IN ('critical','high','medium','low'))` |
-| `tasks.affected_files` | `TEXT` | NO | `'[]'` | JSON array relative POSIX path (rencana file yang disentuh) |
+| `tasks.affected_files` | `TEXT` | NO | `'[]'` | JSON array relative POSIX path (rencana file/dir/glob yang disentuh) |
 | `tasks.modified_files` | `TEXT` | NO | `'[]'` | JSON array relative POSIX path (aktual file yang dimodifikasi) |
+| `tasks.lock_version` | `INTEGER` | NO | `0` | Token optimistik monotonik pada klaim/reclaim/unlock untuk guard TOCTOU & ownership |
 | `tasks.attempt_count` | `INTEGER` | NO | `0` | Bertambah saat verifikasi gagal, stale lease, atau fail/retry |
 | `task_dependencies.(project_id, task_id, depends_on_task_id)` | `TEXT` | NO | PK | FK ke `tasks(project_id, id) ON DELETE CASCADE` |
 | `task_events.id` | `INTEGER` | NO | `AUTOINCREMENT` | PK urutan audit event |
 
 ### 3c. Integritas Data & Query Flow
-- Koneksi SQLite wajib mengaktifkan `PRAGMA journal_mode = WAL;`, `PRAGMA foreign_keys = ON;`, dan `PRAGMA busy_timeout = 5000;`.
+- Koneksi SQLite wajib mengaktifkan `PRAGMA busy_timeout = 5000;`, `PRAGMA journal_mode = WAL;`, `PRAGMA foreign_keys = ON;`, serta migrasi skema terurut via `PRAGMA user_version` (`CURRENT_SCHEMA_VERSION = 3`).
 - Seluruh operasi baca/tulis pada [`TaskRepository`](file:///home/user/Desktop/mcp-tasklist-for-ai/src/storage/task-repository.ts) wajib memfilter `WHERE project_id = ?`.
 - Operasi multi-langkah (batch create, dynamic splitting, atomic claiming) dibungkus dalam `BEGIN IMMEDIATE ... COMMIT` melalui [`DatabaseManager.withImmediateTransaction`](file:///home/user/Desktop/mcp-tasklist-for-ai/src/storage/database.ts).
-- Eksekusi subprocess pada [`completeTask`](file:///home/user/Desktop/mcp-tasklist-for-ai/src/domain/scheduler.ts) dijalankan dalam **3 fase** (Preflight DB $\rightarrow$ Subprocess Verifier di luar DB lock $\rightarrow$ Commit DB) agar proses test yang berjalan lama tidak memblokir koneksi SQLite subagent lain.
+- Eksekusi subprocess pada [`completeTask`](file:///home/user/Desktop/mcp-tasklist-for-ai/src/domain/scheduler.ts) dijalankan dalam **3 fase** (Preflight DB + lock snapshot $\rightarrow$ Subprocess Verifier di luar DB lock dengan auto-heartbeat & `notifications/progress` $\rightarrow$ Re-validasi TOCTOU & Commit DB) agar proses test yang berjalan lama tidak memblokir koneksi SQLite subagent lain.
 
 ---
 
 ## 4. Alur Kerja Sistem (System & Business Flow)
 
 ### 4a. Alur Utama (Happy Path)
-1. **Instalasi & Inisialisasi:** User menjalankan `curl -fsSL <link-bash> | bash` ([`scripts/install.sh`](file:///home/user/Desktop/mcp-tasklist-for-ai/scripts/install.sh)) yang menarik image `moex:latest` lalu mengekstrak `/usr/local/bin/moex` ke `~/.local/bin/moex`. Kemudian user atau AI menjalankan `moex init` di root proyek target untuk membuat `.moex.json`, meng-update `.gitignore` (bila ada), dan mendaftarkan proyek ke `tasklist.db`.
+1. **Instalasi & Inisialisasi:** User menjalankan `curl -fsSL https://raw.githubusercontent.com/rynnn-dev/mcp-tasklist-for-ai/main/scripts/install.sh | bash` ([`scripts/install.sh`](file:///home/user/Desktop/mcp-tasklist-for-ai/scripts/install.sh)) yang menarik image `moex:latest` lalu mengekstrak `/usr/local/bin/moex` ke `~/.local/bin/moex` (atau `--host-build` via Bun lokal). Kemudian user atau AI menjalankan `moex init` di root proyek target untuk membuat `.moex.json`, meng-update `.gitignore` (bila ada), dan mendaftarkan proyek ke `tasklist.db`.
 2. **Penetapan Konteks & Perencanaan DAG:** AI Agent memanggil `set_project_context` lalu `create_tasks` untuk menyusun graf task lengkap beserta `depends_on`, `affected_files`, `acceptance_criteria`, dan `verification_command`.
-3. **Klaim Atomik & Hidrasi Konteks:** AI Agent memanggil `claim_next_task`. Scheduler memulihkan task stale, memfilter task `pending` unblocked, melewati kandidat dengan irisan `affected_files` terhadap task aktif, mengunci kandidat prioritas tertinggi, dan mengembalikan `project_shared_context` + `prerequisite_handoffs`.
-4. **Eksekusi & Mutasi Dinamis:** Agent memperbarui progres (`update_task`) atau menyisipkan sub-task prasyarat (`create_tasks` dengan `blocks_task_ids`) yang otomatis men-suspend task `in_progress` target ke `pending`.
-5. **Active Verification Gate & Penyelesaian:** `complete_task` menjalankan `verification_command` task dan `default_verification_command` proyek di host. Jika lulus, task ditandai `done` dan task hilir terbuka hingga `PROJECT_COMPLETED`.
+3. **Klaim Atomik & Hidrasi Konteks:** AI Agent memanggil `claim_next_task`. Scheduler memulihkan task stale, memfilter task `pending` unblocked, melewati kandidat dengan irisan `affected_files` (file, direktori, atau glob) terhadap task aktif, mengunci kandidat prioritas tertinggi, dan mengembalikan `project_shared_context` + `prerequisite_handoffs`.
+4. **Eksekusi & Mutasi Dinamis:** Agent memperbarui progres (`update_task`), melepas lock untuk handoff (`release_claim`), atau menyisipkan sub-task prasyarat (`create_tasks` dengan `blocks_task_ids`) yang otomatis men-suspend task `in_progress` target ke `pending`.
+5. **Active Verification Gate & Penyelesaian:** `complete_task` menjalankan `verification_command` task dan `default_verification_command` proyek di host (POSIX `sh` atau Windows `cmd.exe`). Jika lulus, task ditandai `done` dan task hilir terbuka hingga `PROJECT_COMPLETED`.
 
 ### 4b. Matriks Penanganan Kondisi Error & Edge Cases
 | Skenario Kegagalan / Edge Case | Deteksi Sistem | Tindakan Sistem | Kode / Respon Error |
@@ -88,7 +90,7 @@
 | `init` dipanggil ulang tanpa `--new`/`--force` | File `.moex.json` sudah ada | Menolak penimpaan agar `project_id` lama tetap aman | `PROJECT_ALREADY_INITIALIZED` |
 | Circular dependency saat mutasi graf | DFS 3-warna menemukan node `VISITING` | Rollback transaksi SQLite dan kembalikan jejak siklus | `CYCLE_DETECTED` |
 | Subagent crash / hang melewati `lease_timeout_minutes` | `now - (heartbeat_at ?? claimed_at) >= lease_timeout` | Naikkan `attempt_count`; reclaim ke `pending` atau `failed` jika mencapai `max_attempts` | `TASK_STALE_RECLAIMED` / `TASK_STALE_FAILED` |
-| Irisan `affected_files` antar subagent paralel | File overlap dengan task `in_progress` aktif | Skip kandidat tersebut atau kembalikan status tunggu | `WAITING_ON_ACTIVE_TASKS` |
+| Irisan `affected_files` antar subagent paralel | File/dir/glob overlap dengan task `in_progress` aktif | Skip kandidat tersebut atau kembalikan status tunggu | `WAITING_ON_ACTIVE_TASKS` |
 | Command verifikasi gagal / timeout | `runVerificationGate` exit $\neq 0$ atau kill process group | Commit `attempt_count` + log error dulu sebelum melempar error | `VERIFICATION_FAILED` |
 
 ---
@@ -98,13 +100,16 @@
 ### 5a. CLI Subcommands (`moex`)
 - `moex init [--dir <path>] [--name <name>] [--config <file>] [--verify-cmd <cmd>] [--no-auto-verify] [--verify-timeout <ms>] [--max-attempts <n>] [--lease-minutes <n>] [--no-require-note] [--new] [--force]`
 - `moex status [--dir <path>] [--config <file>] [--json]`
-- `moex unlock [--dir <path>] [--config <file>] [--task <id> | --all-stale]`
+- `moex show [<task-id> | --task <id>] [--dir <path>] [--config <file>] [--json]`
+- `moex logs [--dir <path>] [--config <file>] [--task <id>] [--limit <n>] [--json]`
+- `moex projects [--prune] [--json]`
+- `moex unlock [--dir <path>] [--config <file>] (--task <id> | --all-stale | --all) [--json]`
 - `moex [serve] [--project-dir <path>] [--config <file>]`
 - `moex --version` / `-v`
 
-### 5b. Kontrak 10 MCP Tools, 2 Resources, & 1 Prompt (`stdio`)
-- **Tools:** `set_project_context`, `create_tasks`, `list_tasks`, `get_task_detail`, `claim_next_task`, `update_task`, `complete_task`, `block_or_fail_task`, `delete_task`, `get_project_summary`.
-- **Resources:** `moex://project/summary`, `moex://project/context`.
+### 5b. Kontrak 10 MCP Tools, Resources, & Prompt (`stdio`)
+- **Tools:** `set_project_context`, `create_tasks`, `list_tasks`, `get_task_detail`, `claim_next_task`, `update_task` (termasuk `release_claim` & `agent_id`), `complete_task` (dengan `notifications/progress`), `block_or_fail_task`, `delete_task`, `get_project_summary` (termasuk `recent_events`).
+- **Resources & ResourceTemplates:** `moex://project/summary`, `moex://project/context`, `moex://projects/{project_id}/summary`, `moex://projects/{project_id}/context`.
 - **Prompt:** `autonomous-workflow`.
 
 ---
@@ -121,7 +126,7 @@
 | [`src/domain/verifier.ts`](file:///home/user/Desktop/mcp-tasklist-for-ai/src/domain/verifier.ts) | Core | Active Verification Gate & process group kill | Tinggi |
 | [`src/domain/scheduler.ts`](file:///home/user/Desktop/mcp-tasklist-for-ai/src/domain/scheduler.ts) | Core | Autonomous scheduler engine | Tinggi |
 | [`src/mcp/server.ts`](file:///home/user/Desktop/mcp-tasklist-for-ai/src/mcp/server.ts) | Interface | Registrasi server `"moex"`, 10 tools, `moex://` resources, prompt | Sedang |
-| [`src/cli/index.ts`](file:///home/user/Desktop/mcp-tasklist-for-ai/src/cli/index.ts) & [`src/index.ts`](file:///home/user/Desktop/mcp-tasklist-for-ai/src/index.ts) | Interface | Entrypoint binary `moex` (`init`, `status`, `unlock`, `serve`, `--version`) | Rendah |
+| [`src/cli/index.ts`](file:///home/user/Desktop/mcp-tasklist-for-ai/src/cli/index.ts) & [`src/index.ts`](file:///home/user/Desktop/mcp-tasklist-for-ai/src/index.ts) | Interface | Entrypoint binary `moex` (`init`, `status`, `show`, `logs`, `projects`, `unlock`, `serve`, `--version`) | Rendah |
 | [`Dockerfile`](file:///home/user/Desktop/mcp-tasklist-for-ai/Dockerfile), [`.dockerignore`](file:///home/user/Desktop/mcp-tasklist-for-ai/.dockerignore), [`scripts/install.sh`](file:///home/user/Desktop/mcp-tasklist-for-ai/scripts/install.sh) | Infra | Build image `moex:latest` (Debian glibc) & bash installer native | Sedang |
 
 ---

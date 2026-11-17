@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
 import {
   existsSync,
   mkdtempSync,
@@ -16,6 +17,7 @@ import {
   normalizeRepoPaths,
   resolveProjectConfig,
 } from "../src/config/project-config.ts";
+import { TaskScheduler } from "../src/domain/scheduler.ts";
 import { DatabaseManager } from "../src/storage/database.ts";
 import { TaskRepository } from "../src/storage/task-repository.ts";
 import { TasklistError } from "../src/types.ts";
@@ -182,7 +184,40 @@ describe("CLI init & per-project config", () => {
     expect(projectRow.project_name).toBe("cli-e2e");
     expect(resolved.config.default_verification_command).toBe("echo ok");
     expect(resolved.config.max_attempts).toBe(4);
+
+    // Create & claim TASK-1, then exercise real `moex unlock` validations and modes
+    const scheduler = new TaskScheduler(repo);
+    scheduler.createTasksBatch(projDir, [{ title: "Locked task via CLI" }]);
+    scheduler.claimNextTask(projDir, "cli-test-worker");
     dbManager.close();
+
+    // Missing explicit mode or empty --task must fail cleanly
+    const unlockNoMode = Bun.spawnSync({
+      cmd: ["bun", "run", entrypoint, "unlock", "--dir", projDir],
+      env: process.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(unlockNoMode.exitCode).toBe(1);
+
+    const unlockEmptyTask = Bun.spawnSync({
+      cmd: ["bun", "run", entrypoint, "unlock", "--dir", projDir, "--task", ""],
+      env: process.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(unlockEmptyTask.exitCode).toBe(1);
+
+    const unlockAllProc = Bun.spawnSync({
+      cmd: ["bun", "run", entrypoint, "unlock", "--dir", projDir, "--all", "--json"],
+      env: process.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(unlockAllProc.exitCode).toBe(0);
+    expect(JSON.parse(unlockAllProc.stdout.toString())).toEqual({
+      unlocked_task_ids: ["TASK-1"],
+    });
 
     const statusProc = Bun.spawnSync({
       cmd: ["bun", "run", entrypoint, "status", "--dir", projDir, "--json"],
@@ -193,7 +228,8 @@ describe("CLI init & per-project config", () => {
     expect(statusProc.exitCode).toBe(0);
     const parsedStatus = JSON.parse(statusProc.stdout.toString());
     expect(parsedStatus.project.project_name).toBe("cli-e2e");
-    expect(parsedStatus.counts.total).toBe(0);
+    expect(parsedStatus.counts.total).toBe(1);
+    expect(parsedStatus.counts.pending).toBe(1);
   });
 
   test("normalizeRepoPaths rejects symlinks pointing outside project root", () => {
@@ -218,7 +254,7 @@ describe("CLI init & per-project config", () => {
     ]);
   });
 
-  test("DatabaseManager tracks PRAGMA user_version and CLI show, logs, and projects --prune work end-to-end", () => {
+  test("DatabaseManager tracks PRAGMA user_version v3 and CLI show, logs, and projects --prune work end-to-end", () => {
     const projA = path.join(tempRoot, "cli-obs-a");
     const projB = path.join(tempRoot, "cli-obs-b");
     mkdirSync(projA, { recursive: true });
@@ -226,42 +262,68 @@ describe("CLI init & per-project config", () => {
 
     const entrypoint = path.resolve(import.meta.dir, "../src/index.ts");
 
-    Bun.spawnSync({
+    const initA = Bun.spawnSync({
       cmd: ["bun", "run", entrypoint, "init", "--dir", projA, "--name", "obs-a"],
       env: process.env,
       stdout: "pipe",
       stderr: "pipe",
     });
-    Bun.spawnSync({
+    expect(initA.exitCode).toBe(0);
+
+    const initB = Bun.spawnSync({
       cmd: ["bun", "run", entrypoint, "init", "--dir", projB, "--name", "obs-b"],
       env: process.env,
       stdout: "pipe",
       stderr: "pipe",
     });
+    expect(initB.exitCode).toBe(0);
 
     const dbManager = new DatabaseManager();
-    expect(dbManager.getSchemaVersion()).toBe(2);
-    const repo = new TaskRepository(dbManager);
+    expect(dbManager.getSchemaVersion()).toBe(3);
     const resolvedA = resolveProjectConfig(projA);
+    const scheduler = new TaskScheduler(new TaskRepository(dbManager));
+    scheduler.createTasksBatch(projA, [
+      {
+        title: "Inspectable task",
+        description: "Detailed task body",
+        acceptance_criteria: ["criterion-a"],
+        verification_command: "echo verified",
+        priority: "high",
+      },
+    ]);
     dbManager.close();
 
-    // Create a task in projA via scheduler
-    const db2 = new DatabaseManager();
-    const { TaskScheduler } = require("../src/domain/scheduler.ts") as typeof import("../src/domain/scheduler.ts");
-    const scheduler = new TaskScheduler(new TaskRepository(db2));
-    scheduler.createTasksBatch(projA, [{ title: "Inspectable task", priority: "high" }]);
-    db2.close();
-
-    const showProc = Bun.spawnSync({
+    const showJsonProc = Bun.spawnSync({
       cmd: ["bun", "run", entrypoint, "show", "TASK-1", "--dir", projA, "--json"],
       env: process.env,
       stdout: "pipe",
       stderr: "pipe",
     });
-    expect(showProc.exitCode).toBe(0);
-    const showJson = JSON.parse(showProc.stdout.toString());
+    expect(showJsonProc.exitCode).toBe(0);
+    const showJson = JSON.parse(showJsonProc.stdout.toString());
     expect(showJson.task.id).toBe("TASK-1");
     expect(showJson.task.title).toBe("Inspectable task");
+
+    const showTextProc = Bun.spawnSync({
+      cmd: ["bun", "run", entrypoint, "show", "TASK-1", "--dir", projA],
+      env: process.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(showTextProc.exitCode).toBe(0);
+    const showText = showTextProc.stdout.toString();
+    expect(showText).toContain("description: Detailed task body");
+    expect(showText).toContain("verify_cmd : echo verified");
+    expect(showText).toContain("criterion-a");
+    expect(showText).toContain("events (");
+
+    const logsBadLimit = Bun.spawnSync({
+      cmd: ["bun", "run", entrypoint, "logs", "--dir", projA, "--limit", "0"],
+      env: process.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(logsBadLimit.exitCode).toBe(1);
 
     const logsProc = Bun.spawnSync({
       cmd: ["bun", "run", entrypoint, "logs", "--dir", projA, "--limit", "10", "--json"],
@@ -287,6 +349,193 @@ describe("CLI init & per-project config", () => {
     expect(pruneJson.removed_projects.length).toBe(1);
     expect(pruneJson.removed_projects[0].project_name).toBe("obs-b");
     expect(pruneJson.remaining_count).toBe(1);
-    expect(repo).toBeDefined();
+  });
+
+  test("compiled native binary via install.sh --host-build ignores target repo .env", () => {
+    const repoRoot = path.resolve(import.meta.dir, "..");
+    const binDir = path.join(tempRoot, "compiled-bin");
+    const targetProj = path.join(tempRoot, "dotenv-poisoned-proj");
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(targetProj, { recursive: true });
+
+    // Poisoned .env inside target project root (must NOT be autoloaded by compiled moex binary)
+    writeFileSync(
+      path.join(targetProj, ".env"),
+      "MOEX_DB_PATH=/dev/null/impossible/corrupt.db\nMOEX_CONFIG=../../escape.json\n",
+      "utf8"
+    );
+
+    const installProc = Bun.spawnSync({
+      cmd: ["bash", "./scripts/install.sh", "--host-build", "--bin-dir", binDir],
+      cwd: repoRoot,
+      env: process.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(installProc.exitCode).toBe(0);
+
+    const binaryPath = path.join(binDir, "moex");
+    expect(existsSync(binaryPath)).toBe(true);
+
+    const initProc = Bun.spawnSync({
+      cmd: [binaryPath, "init", "--name", "dotenv-safe"],
+      cwd: targetProj,
+      env: {
+        ...process.env,
+        MOEX_DB_PATH: path.join(tempRoot, "compiled-central.db"),
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(initProc.exitCode).toBe(0);
+    expect(existsSync(path.join(targetProj, ".moex.json"))).toBe(true);
+
+    const statusProc = Bun.spawnSync({
+      cmd: [binaryPath, "status", "--json"],
+      cwd: targetProj,
+      env: {
+        ...process.env,
+        MOEX_DB_PATH: path.join(tempRoot, "compiled-central.db"),
+      },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    expect(statusProc.exitCode).toBe(0);
+    const statusJson = JSON.parse(statusProc.stdout.toString());
+    expect(statusJson.project.project_name).toBe("dotenv-safe");
+  }, 20000);
+
+  test("migrates legacy v0 SQLite DB to v3 (backfilling last_seq_num and tasks.lock_version) and enforces init validation", () => {
+    const legacyDbPath = path.join(tempRoot, "legacy-v0.db");
+    const legacyProj = path.join(tempRoot, "legacy-proj");
+    mkdirSync(legacyProj, { recursive: true });
+    const init = initProjectConfig({ dir: legacyProj, projectName: "legacy-proj" });
+    const projectId = init.config.project_id;
+
+    // Construct an authentic pre-migration v0 DB (no last_seq_num, no lock_version, user_version=0)
+    const raw = new Database(legacyDbPath, { create: true, strict: true });
+    raw.exec(`
+      CREATE TABLE projects (
+        project_id TEXT PRIMARY KEY,
+        project_name TEXT NOT NULL,
+        root_path TEXT NOT NULL,
+        config_path TEXT NOT NULL,
+        shared_context TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE TABLE tasks (
+        project_id TEXT NOT NULL REFERENCES projects(project_id) ON DELETE CASCADE,
+        id TEXT NOT NULL,
+        seq_num INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        category TEXT NOT NULL DEFAULT 'general',
+        status TEXT NOT NULL,
+        priority TEXT NOT NULL,
+        acceptance_criteria TEXT NOT NULL DEFAULT '[]',
+        verification_command TEXT,
+        affected_files TEXT NOT NULL DEFAULT '[]',
+        modified_files TEXT NOT NULL DEFAULT '[]',
+        handoff_notes TEXT NOT NULL DEFAULT '',
+        verification_note TEXT NOT NULL DEFAULT '',
+        last_verification_output TEXT NOT NULL DEFAULT '',
+        claimed_by TEXT,
+        claimed_at TEXT,
+        heartbeat_at TEXT,
+        attempt_count INTEGER NOT NULL DEFAULT 0,
+        blocker_reason TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        PRIMARY KEY (project_id, id),
+        UNIQUE (project_id, seq_num)
+      );
+      CREATE TABLE task_dependencies (
+        project_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        depends_on_task_id TEXT NOT NULL,
+        PRIMARY KEY (project_id, task_id, depends_on_task_id)
+      );
+      CREATE TABLE task_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_id TEXT NOT NULL,
+        task_id TEXT,
+        event_type TEXT NOT NULL,
+        actor TEXT NOT NULL DEFAULT 'system',
+        details TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL
+      );
+    `);
+    const now = new Date().toISOString();
+    raw
+      .query(
+        "INSERT INTO projects (project_id, project_name, root_path, config_path, shared_context, created_at, updated_at) VALUES (?, ?, ?, ?, '{}', ?, ?)"
+      )
+      .run(projectId, "legacy-proj", legacyProj, init.config_path, now, now);
+    raw
+      .query(
+        "INSERT INTO tasks (project_id, id, seq_num, title, status, priority, created_at, updated_at) VALUES (?, ?, ?, ?, 'done', 'medium', ?, ?)"
+      )
+      .run(projectId, "TASK-2", 2, "Second task", now, now);
+    raw
+      .query(
+        "INSERT INTO tasks (project_id, id, seq_num, title, status, priority, created_at, updated_at) VALUES (?, ?, ?, ?, 'done', 'medium', ?, ?)"
+      )
+      .run(projectId, "TASK-10", 10, "Tenth task", now, now);
+    raw.close();
+
+    const migratedDb = new DatabaseManager(legacyDbPath);
+    expect(migratedDb.getSchemaVersion()).toBe(3);
+
+    const projRow = migratedDb.db
+      .query<{ last_seq_num: number }, [string]>(
+        "SELECT last_seq_num FROM projects WHERE project_id = ?"
+      )
+      .get(projectId);
+    expect(projRow?.last_seq_num).toBe(10);
+
+    const taskRow = migratedDb.db
+      .query<{ lock_version: number }, [string, string]>(
+        "SELECT lock_version FROM tasks WHERE project_id = ? AND id = ?"
+      )
+      .get(projectId, "TASK-10");
+    expect(taskRow?.lock_version).toBe(0);
+
+    const scheduler = new TaskScheduler(new TaskRepository(migratedDb));
+    const nextBatch = scheduler.createTasksBatch(legacyProj, [{ title: "Post-migration task" }]);
+    expect(nextBatch.tasks[0]?.id).toBe("TASK-11");
+    expect(nextBatch.tasks[0]?.lock_version).toBe(0);
+    migratedDb.close();
+
+    // Corrupt config: --force refuses silent UUID rotation, --new succeeds
+    writeFileSync(init.config_path, "{broken-json", "utf8");
+    expect(() =>
+      initProjectConfig({ dir: legacyProj, projectName: "legacy-proj", force: true })
+    ).toThrow(TasklistError);
+
+    const resetInit = initProjectConfig({
+      dir: legacyProj,
+      projectName: "legacy-reborn",
+      newProject: true,
+    });
+    expect(resetInit.config.project_id).not.toBe(projectId);
+
+    // CLI init validates range bounds and rejects empty flags
+    const entrypoint = path.resolve(import.meta.dir, "../src/index.ts");
+    for (const badArgs of [
+      ["init", "--dir", ""],
+      ["init", "--dir", legacyProj, "--verify-timeout", "100"],
+      ["init", "--dir", legacyProj, "--max-attempts", "0"],
+      ["init", "--dir", legacyProj, "--lease-minutes", "2000"],
+    ]) {
+      const badProc = Bun.spawnSync({
+        cmd: ["bun", "run", entrypoint, ...badArgs],
+        env: process.env,
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      expect(badProc.exitCode).toBe(1);
+    }
   });
 });

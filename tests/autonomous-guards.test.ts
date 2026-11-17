@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { initProjectConfig } from "../src/config/project-config.ts";
@@ -11,6 +11,16 @@ import { TasklistError } from "../src/types.ts";
 let tempRoot = "";
 let dbManager: DatabaseManager;
 let scheduler: TaskScheduler;
+
+async function waitForFile(filePath: string, timeoutMs = 5000): Promise<void> {
+  const start = Date.now();
+  while (!existsSync(filePath)) {
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`Timed out waiting for marker file "${filePath}".`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 15));
+  }
+}
 
 beforeEach(() => {
   tempRoot = mkdtempSync(path.join(os.tmpdir(), "mcp-tasklist-guards-test-"));
@@ -140,12 +150,13 @@ describe("Autonomous Guardrails: Active Verification Gate, Stale Recovery, & Fil
 
     scheduler.createTasksBatch(projDir, [
       {
-        title: "Hanging verification command",
-        verification_command: "sleep 5",
+        title: "Hanging verification command with grandchild",
+        verification_command: 'sh -c "sleep 10 & wait"',
       },
     ]);
 
     scheduler.claimNextTask(projDir, "agent-1");
+    const startedAt = Date.now();
     try {
       await scheduler.completeTask(projDir, "TASK-1", {
         agent_id: "agent-1",
@@ -153,9 +164,11 @@ describe("Autonomous Guardrails: Active Verification Gate, Stale Recovery, & Fil
       });
       expect.unreachable("Expected timeout failure");
     } catch (err) {
+      const elapsedMs = Date.now() - startedAt;
       expect(err).toBeInstanceOf(TasklistError);
       expect((err as TasklistError).code).toBe("VERIFICATION_FAILED");
       expect((err as TasklistError).message).toContain("exceeded 1000ms");
+      expect(elapsedMs).toBeLessThan(4000);
     }
   });
 
@@ -172,9 +185,14 @@ describe("Autonomous Guardrails: Active Verification Gate, Stale Recovery, & Fil
     scheduler.createTasksBatch(projDir, [{ title: "Long running task" }]);
     const firstClaim = scheduler.claimNextTask(projDir, "crashed-worker");
     expect(firstClaim.task?.id).toBe("TASK-1");
-    scheduler.updateTask(projDir, "TASK-1", {
-      handoff_notes: "Completed 50% of parser",
-    });
+    scheduler.updateTask(
+      projDir,
+      "TASK-1",
+      {
+        handoff_notes: "Completed 50% of parser",
+      },
+      "crashed-worker"
+    );
 
     // Simulate 15 minutes elapsed without heartbeat
     const staleIso = new Date(Date.now() - 15 * 60_000).toISOString();
@@ -259,14 +277,21 @@ describe("Autonomous Guardrails: Active Verification Gate, Stale Recovery, & Fil
     mkdirSync(projDir, { recursive: true });
     initProjectConfig({ dir: projDir, projectName: "toctou-proj" });
 
+    const started1 = path.join(projDir, "started1.flag");
+    const release1 = path.join(projDir, "release1.flag");
+    const started2 = path.join(projDir, "started2.flag");
+    const release2 = path.join(projDir, "release2.flag");
+
     scheduler.createTasksBatch(projDir, [
       {
         title: "Slow verification task",
-        verification_command: "sleep 0.25 && echo 'slow pass'",
+        verification_command:
+          'bun -e "const fs=require(\'node:fs\');fs.writeFileSync(\'started1.flag\',\'1\');const t=Date.now();while(!fs.existsSync(\'release1.flag\')&&Date.now()-t<4000){Bun.sleepSync(15);}"',
       },
       {
         title: "Second slow verification task",
-        verification_command: "sleep 0.25 && echo 'slow pass 2'",
+        verification_command:
+          'bun -e "const fs=require(\'node:fs\');fs.writeFileSync(\'started2.flag\',\'1\');const t=Date.now();while(!fs.existsSync(\'release2.flag\')&&Date.now()-t<4000){Bun.sleepSync(15);}"',
       },
     ]);
 
@@ -279,13 +304,14 @@ describe("Autonomous Guardrails: Active Verification Gate, Stale Recovery, & Fil
       verification_note: "Finished work before prerequisite was discovered",
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 60));
+    await waitForFile(started1);
     scheduler.createTasksBatch(projDir, [
       {
         title: "Injected prerequisite during verification",
         blocks_task_ids: ["TASK-1"],
       },
     ]);
+    writeFileSync(release1, "go", "utf8");
 
     try {
       await completionPromise;
@@ -310,13 +336,14 @@ describe("Autonomous Guardrails: Active Verification Gate, Stale Recovery, & Fil
       verification_note: "Trying to complete after losing lock",
     });
 
-    await new Promise((resolve) => setTimeout(resolve, 60));
+    await waitForFile(started2);
     scheduler.unlockTasks(projDir, { taskId: "TASK-2" });
     const reclaimedByB = scheduler.claimNextTask(projDir, "agent-b", {
       prefer_task_id: "TASK-2",
     });
     expect(reclaimedByB.task?.id).toBe("TASK-2");
     expect(reclaimedByB.task?.claimed_by).toBe("agent-b");
+    writeFileSync(release2, "go", "utf8");
 
     try {
       await hijackPromise;
@@ -340,7 +367,7 @@ describe("Autonomous Guardrails: Active Verification Gate, Stale Recovery, & Fil
     const claim = scheduler.claimNextTask(projDir, "owner-agent");
     expect(claim.task?.id).toBe("TASK-1");
 
-    // Wrong agent cannot update task (unless reset_to_pending=true)
+    // Wrong or missing/empty agent cannot update task (unless reset_to_pending=true)
     expect(() =>
       scheduler.updateTask(
         projDir,
@@ -350,12 +377,32 @@ describe("Autonomous Guardrails: Active Verification Gate, Stale Recovery, & Fil
       )
     ).toThrow(TasklistError);
 
-    // Wrong agent cannot block/fail task
+    expect(() =>
+      scheduler.updateTask(projDir, "TASK-1", { handoff_notes: "Anonymous note" })
+    ).toThrow(TasklistError);
+
+    expect(() =>
+      scheduler.updateTask(
+        projDir,
+        "TASK-1",
+        { handoff_notes: "Blank actor" },
+        "   "
+      )
+    ).toThrow(TasklistError);
+
+    // Wrong or missing/empty agent cannot block/fail task
     expect(() =>
       scheduler.blockOrFailTask(projDir, "TASK-1", {
         agent_id: "intruder-agent",
         outcome: "failed",
         reason: "Intruder failure",
+      })
+    ).toThrow(TasklistError);
+
+    expect(() =>
+      scheduler.blockOrFailTask(projDir, "TASK-1", {
+        outcome: "blocked",
+        reason: "Anonymous blocker",
       })
     ).toThrow(TasklistError);
 
@@ -439,5 +486,198 @@ describe("Autonomous Guardrails: Active Verification Gate, Stale Recovery, & Fil
       "TASK-2",
       "TASK-4",
     ]);
+  });
+
+  test("multi-process parallel claimNextTask serializes cleanly via BEGIN IMMEDIATE with zero double-claims", async () => {
+    const projDir = path.join(tempRoot, "parallel-claim-proj");
+    mkdirSync(projDir, { recursive: true });
+    initProjectConfig({ dir: projDir, projectName: "parallel-claim-proj" });
+
+    scheduler.createTasksBatch(projDir, [
+      { title: "Parallel task 1", affected_files: ["src/p1.ts"] },
+      { title: "Parallel task 2", affected_files: ["src/p2.ts"] },
+      { title: "Parallel task 3", affected_files: ["src/p3.ts"] },
+      { title: "Parallel task 4", affected_files: ["src/p4.ts"] },
+    ]);
+
+    const dbFile = path.join(tempRoot, "central.db");
+    const repoRoot = path.resolve(import.meta.dir, "..");
+    const workerScript = `
+      import { DatabaseManager } from ${JSON.stringify(
+        path.join(repoRoot, "src/storage/database.ts")
+      )};
+      import { TaskRepository } from ${JSON.stringify(
+        path.join(repoRoot, "src/storage/task-repository.ts")
+      )};
+      import { TaskScheduler } from ${JSON.stringify(
+        path.join(repoRoot, "src/domain/scheduler.ts")
+      )};
+      const db = new DatabaseManager(process.env.TEST_DB_PATH);
+      const s = new TaskScheduler(new TaskRepository(db));
+      const res = s.claimNextTask(process.env.TEST_PROJ_DIR, process.env.TEST_AGENT_ID!);
+      console.log(JSON.stringify({ outcome: res.outcome, taskId: res.task?.id ?? null, agentId: process.env.TEST_AGENT_ID }));
+      db.close();
+    `;
+
+    const workers = Array.from({ length: 6 }, (_, idx) => {
+      const proc = Bun.spawn(["bun", "-e", workerScript], {
+        env: {
+          ...process.env,
+          TEST_DB_PATH: dbFile,
+          TEST_PROJ_DIR: projDir,
+          TEST_AGENT_ID: `parallel-worker-${idx + 1}`,
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      });
+      return proc.exited.then(async (exitCode) => {
+        const stdout = await new Response(proc.stdout).text();
+        const stderr = await new Response(proc.stderr).text();
+        return { exitCode, stdout, stderr };
+      });
+    });
+
+    const results = await Promise.all(workers);
+    for (const r of results) {
+      expect(r.stderr).toBe("");
+      expect(r.exitCode).toBe(0);
+    }
+
+    const parsed = results.map(
+      (r) =>
+        JSON.parse(r.stdout.trim()) as {
+          outcome: string;
+          taskId: string | null;
+          agentId: string;
+        }
+    );
+
+    const claimed = parsed.filter((p) => p.outcome === "TASK_CLAIMED");
+    const waiting = parsed.filter((p) => p.outcome === "WAITING_ON_ACTIVE_TASKS");
+
+    expect(claimed.length).toBe(4);
+    expect(waiting.length).toBe(2);
+    expect(new Set(claimed.map((c) => c.taskId)).size).toBe(4);
+  });
+
+  test("completeTask preserves prior modified_files and rejects config drift mid-verification", async () => {
+    const projDir = path.join(tempRoot, "drift-proj");
+    mkdirSync(projDir, { recursive: true });
+    initProjectConfig({
+      dir: projDir,
+      projectName: "drift-proj",
+      defaultVerificationCommand: "echo baseline-v1",
+    });
+
+    const startedFlag = path.join(projDir, "drift-started.flag");
+    const releaseFlag = path.join(projDir, "drift-release.flag");
+
+    scheduler.createTasksBatch(projDir, [
+      {
+        title: "Task recording intermediate modified files",
+        verification_command: "echo task-ok",
+      },
+      {
+        title: "Task hit by config drift mid-verification",
+        verification_command:
+          'bun -e "const fs=require(\'node:fs\');fs.writeFileSync(\'drift-started.flag\',\'1\');const t=Date.now();while(!fs.existsSync(\'drift-release.flag\')&&Date.now()-t<4000){Bun.sleepSync(15);}"',
+      },
+    ]);
+
+    scheduler.claimNextTask(projDir, "agent-1", { prefer_task_id: "TASK-1" });
+    scheduler.updateTask(
+      projDir,
+      "TASK-1",
+      { modified_files: ["src/step1.ts"] },
+      "agent-1"
+    );
+    const done1 = await scheduler.completeTask(projDir, "TASK-1", {
+      agent_id: "agent-1",
+      verification_note: "Done after step 1 & step 2",
+      modified_files: ["src/step2.ts", "src/step1.ts"],
+    });
+    expect(done1.task.modified_files).toEqual(["src/step1.ts", "src/step2.ts"]);
+
+    scheduler.claimNextTask(projDir, "agent-2", { prefer_task_id: "TASK-2" });
+    const completionPromise = scheduler.completeTask(projDir, "TASK-2", {
+      agent_id: "agent-2",
+      verification_note: "Testing config drift guard",
+    });
+
+    await waitForFile(startedFlag);
+    initProjectConfig({
+      dir: projDir,
+      projectName: "drift-proj",
+      defaultVerificationCommand: "echo baseline-tampered",
+      force: true,
+    });
+    writeFileSync(releaseFlag, "go", "utf8");
+
+    try {
+      await completionPromise;
+      expect.unreachable("Expected completeTask Phase 3 to reject config drift");
+    } catch (err) {
+      expect(err).toBeInstanceOf(TasklistError);
+      expect((err as TasklistError).code).toBe("INVALID_STATE_TRANSITION");
+    }
+  });
+
+  test("stale recovery and blockOrFailTask(retry_later) transition to failed at max_attempts", () => {
+    const projDir = path.join(tempRoot, "exhaust-proj");
+    mkdirSync(projDir, { recursive: true });
+    const init = initProjectConfig({
+      dir: projDir,
+      projectName: "exhaust-proj",
+      leaseTimeoutMinutes: 5,
+      maxAttempts: 2,
+    });
+
+    scheduler.createTasksBatch(projDir, [
+      { title: "Stale exhaustion task" },
+      { title: "Retry exhaustion task" },
+    ]);
+
+    // 1. Stale task already at attempt_count = 1 with max_attempts = 2 -> becomes failed on stale recovery
+    scheduler.claimNextTask(projDir, "worker-stale", { prefer_task_id: "TASK-1" });
+    const staleIso = new Date(Date.now() - 10 * 60_000).toISOString();
+    dbManager.db
+      .query(
+        "UPDATE tasks SET attempt_count = 1, heartbeat_at = ?, claimed_at = ? WHERE project_id = ? AND id = ?"
+      )
+      .run(staleIso, staleIso, init.config.project_id, "TASK-1");
+
+    const next = scheduler.claimNextTask(projDir, "worker-2");
+    expect(next.outcome).toBe("TASK_CLAIMED");
+    expect(next.task?.id).toBe("TASK-2");
+    expect(next.stale_reclaimed_task_ids).toEqual([]);
+
+    const t1Detail = scheduler.getTaskDetail(projDir, "TASK-1");
+    expect(t1Detail.task.status).toBe("failed");
+    expect(t1Detail.task.attempt_count).toBe(2);
+    expect(t1Detail.events.some((e) => e.event_type === "TASK_STALE_FAILED")).toBe(true);
+
+    // 2. TASK-2: first retry_later -> pending (attempt_count=1), reclaim -> second retry_later -> failed (attempt_count=2)
+    const retry1 = scheduler.blockOrFailTask(projDir, "TASK-2", {
+      agent_id: "worker-2",
+      outcome: "retry_later",
+      reason: "Temporary issue #1",
+    });
+    expect(retry1.status).toBe("pending");
+    expect(retry1.attempt_count).toBe(1);
+
+    const reclaim2 = scheduler.claimNextTask(projDir, "worker-3");
+    expect(reclaim2.task?.id).toBe("TASK-2");
+
+    const retry2 = scheduler.blockOrFailTask(projDir, "TASK-2", {
+      agent_id: "worker-3",
+      outcome: "retry_later",
+      reason: "Temporary issue #2",
+    });
+    expect(retry2.status).toBe("failed");
+    expect(retry2.attempt_count).toBe(2);
+    expect(retry2.blocker_reason).toContain("reached max_attempts 2");
+
+    const blockedQueue = scheduler.claimNextTask(projDir, "worker-4");
+    expect(blockedQueue.outcome).toBe("BLOCKED_BY_FAILURES");
   });
 });

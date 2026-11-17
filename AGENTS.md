@@ -26,29 +26,32 @@ Dokumen ini adalah panduan operasional wajib bagi seluruh AI Coding Agents (**Cl
 ├── README.md                     # Dokumentasi pengguna, bash installer, & konfigurasi client MCP
 ├── Dockerfile                    # Multi-stage glibc build menghasilkan binary /usr/local/bin/moex
 ├── .dockerignore                 # Pengecualian context Docker build
+├── .github/
+│   └── workflows/
+│       └── ci.yml                # Pipeline CI GitHub Actions (typecheck, test, build:bin, docker)
 ├── scripts/
-│   └── install.sh                # Bash installer (pull/build moex:latest & ekstrak binary native)
+│   └── install.sh                # Bash installer (pull/build moex:latest, --host-build, & ekstrak binary)
 ├── src/
 │   ├── index.ts                  # Entrypoint utama (shebang Bun, routing CLI vs MCP stdio)
 │   ├── types.ts                  # MOEX_VERSION, tipe domain, skema Zod, & TasklistError
 │   ├── cli/
-│   │   └── index.ts              # Parser & handler CLI (init, status, unlock, serve, --version)
+│   │   └── index.ts              # Parser & handler CLI (init, status, show, logs, projects, unlock, serve, --version)
 │   ├── config/
-│   │   └── project-config.ts     # Resolusi .moex.json, atomic write, .gitignore guard, path normalizer
+│   │   └── project-config.ts     # Resolusi .moex.json, atomic write, .gitignore guard, path/symlink/glob helpers
 │   ├── storage/
-│   │   ├── database.ts           # Koneksi bun:sqlite (~/.local/share/moex/tasklist.db), WAL, transaksi
+│   │   ├── database.ts           # Koneksi bun:sqlite (~/.local/share/moex/tasklist.db), WAL, PRAGMA user_version
 │   │   └── task-repository.ts    # Query SQL terpartisi per project_id, dependency edges, & task_events
 │   ├── domain/
 │   │   ├── dag.ts                # Validasi anti-cycle (3-color DFS) & topological execution waves
-│   │   ├── verifier.ts           # Active Verification Gate runner (detached process group & timeout kill)
-│   │   └── scheduler.ts          # Engine otonom (claiming, stale recovery, file lock, dynamic split)
+│   │   ├── verifier.ts           # Active Verification Gate runner (POSIX/Windows shell, timeout kill, progress)
+│   │   └── scheduler.ts          # Engine otonom (claiming, TOCTOU/ownership guard, stale recovery, file lock)
 │   └── mcp/
-│       └── server.ts             # Registrasi server "moex": 10 Tools, 2 Resources (moex://), & 1 Prompt
+│       └── server.ts             # Registrasi server "moex": 10 Tools, 2 Resources + 2 Templates, & 1 Prompt
 └── tests/
-    ├── cli-init.test.ts          # Pengujian CLI init (.moex.json), --version, .gitignore, & upward traversal
-    ├── scheduler-dag.test.ts     # Pengujian isolasi multi-proyek, DAG, shared context, & task splitting
-    ├── autonomous-guards.test.ts # Pengujian Active Verification Gate, timeout kill, stale, & file locks
-    └── mcp-server.test.ts        # Pengujian E2E MCP protocol (InMemoryTransport & StdioClientTransport)
+    ├── cli-init.test.ts          # Pengujian CLI init/show/logs/projects, --version, symlink guard, & migrasi DB
+    ├── scheduler-dag.test.ts     # Pengujian isolasi multi-proyek, DAG invariants, shared context, & task splitting
+    ├── autonomous-guards.test.ts # Pengujian Active Verification Gate, TOCTOU, ownership, stale, & glob file locks
+    └── mcp-server.test.ts        # Pengujian E2E MCP protocol (InMemory, stdio, ResourceTemplate, & progress)
 ```
 
 ---
@@ -59,7 +62,7 @@ Setiap perubahan kode di masa depan **WAJIB** mematuhi 7 invarian berikut:
 
 1. **Kemurnian Stream `stdout` pada Mode MCP (`stdio`):**
    - Di dalam [`src/mcp/`](file:///home/user/Desktop/mcp-tasklist-for-ai/src/mcp/server.ts), [`src/domain/`](file:///home/user/Desktop/mcp-tasklist-for-ai/src/domain/scheduler.ts), [`src/storage/`](file:///home/user/Desktop/mcp-tasklist-for-ai/src/storage/database.ts), dan [`src/config/`](file:///home/user/Desktop/mcp-tasklist-for-ai/src/config/project-config.ts), **DILARANG KERAS** memanggil `console.log(...)` karena `stdout` dipakai secara eksklusif oleh frame JSON-RPC MCP.
-   - Gunakan `process.stderr.write(...)` dengan prefix `[moex]` untuk seluruh kebutuhan logging diagnostik server. (`console.log` hanya boleh ada di [`src/cli/index.ts`](file:///home/user/Desktop/mcp-tasklist-for-ai/src/cli/index.ts) saat menjalankan subcommand terminal `init`, `status`, `unlock`, `--version`, atau `--help`).
+   - Gunakan `process.stderr.write(...)` dengan prefix `[moex]` untuk seluruh kebutuhan logging diagnostik server. (`console.log` hanya boleh ada di [`src/cli/index.ts`](file:///home/user/Desktop/mcp-tasklist-for-ai/src/cli/index.ts) saat menjalankan subcommand terminal `init`, `status`, `show`, `logs`, `projects`, `unlock`, `--version`, atau `--help`).
 2. **Isolasi Ketat `project_id` & Larangan Auto-Init Global:**
    - Setiap tabel dan query di [`src/storage/task-repository.ts`](file:///home/user/Desktop/mcp-tasklist-for-ai/src/storage/task-repository.ts) wajib memfilter berdasarkan `project_id` (UUID v4 dari `.moex.json`).
    - Jangan pernah membuat fitur yang menginisialisasi `.moex.json` secara diam-diam di `$HOME` atau direktori acak. Inisialisasi proyek baru wajib melalui CLI `moex init`.

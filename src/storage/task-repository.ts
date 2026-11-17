@@ -39,6 +39,7 @@ interface RawTaskRow {
   claimed_by: string | null;
   claimed_at: string | null;
   heartbeat_at: string | null;
+  lock_version: number;
   attempt_count: number;
   blocker_reason: string;
   created_at: string;
@@ -69,6 +70,10 @@ export class TaskRepository {
 
   public withTransaction<T>(fn: () => T): T {
     return this.dbManager.withImmediateTransaction(fn);
+  }
+
+  public withReadTransaction<T>(fn: () => T): T {
+    return this.dbManager.withReadTransaction(fn);
   }
 
   public upsertProject(resolved: ResolvedProject): ProjectRecord {
@@ -147,7 +152,9 @@ export class TaskRepository {
           COALESCE(
             (SELECT MAX(CAST(SUBSTR(task_id, 6) AS INTEGER))
              FROM task_events
-             WHERE project_id = ? AND task_id GLOB 'TASK-[0-9]*'),
+             WHERE project_id = ?
+               AND task_id GLOB 'TASK-[0-9]*'
+               AND SUBSTR(task_id, 6) NOT GLOB '*[^0-9]*'),
             0
           )
         ) AS high_water`
@@ -173,9 +180,9 @@ export class TaskRepository {
           project_id, id, seq_num, title, description, category, status, priority,
           acceptance_criteria, verification_command, affected_files, modified_files,
           handoff_notes, verification_note, last_verification_output,
-          claimed_by, claimed_at, heartbeat_at, attempt_count, blocker_reason,
+          claimed_by, claimed_at, heartbeat_at, lock_version, attempt_count, blocker_reason,
           created_at, updated_at, completed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         task.project_id,
@@ -196,6 +203,7 @@ export class TaskRepository {
         task.claimed_by,
         task.claimed_at,
         task.heartbeat_at,
+        task.lock_version,
         task.attempt_count,
         task.blocker_reason,
         task.created_at,
@@ -223,6 +231,8 @@ export class TaskRepository {
       claimed_by: string | null;
       claimed_at: string | null;
       heartbeat_at: string | null;
+      lock_version: number;
+      increment_lock_version: boolean;
       attempt_count: number;
       blocker_reason: string;
       updated_at: string;
@@ -291,6 +301,12 @@ export class TaskRepository {
     if (fields.heartbeat_at !== undefined) {
       sets.push("heartbeat_at = ?");
       values.push(fields.heartbeat_at);
+    }
+    if (fields.lock_version !== undefined) {
+      sets.push("lock_version = ?");
+      values.push(fields.lock_version);
+    } else if (fields.increment_lock_version) {
+      sets.push("lock_version = lock_version + 1");
     }
     if (fields.attempt_count !== undefined) {
       sets.push("attempt_count = ?");
@@ -460,23 +476,32 @@ export class TaskRepository {
     limit = 30,
     taskId?: string
   ): TaskEventRecord[] {
-    const rows = taskId
-      ? this.dbManager.db
-          .query<RawEventRow, [string, string, number]>(
-            `SELECT * FROM task_events
-             WHERE project_id = ? AND task_id = ?
-             ORDER BY id DESC
-             LIMIT ?`
-          )
-          .all(projectId, taskId, limit)
-      : this.dbManager.db
-          .query<RawEventRow, [string, number]>(
-            `SELECT * FROM task_events
-             WHERE project_id = ?
-             ORDER BY id DESC
-             LIMIT ?`
-          )
-          .all(projectId, limit);
+    if (taskId !== undefined && !taskId.trim()) {
+      throw new TasklistError("VALIDATION_ERROR", "task_id filter cannot be empty.");
+    }
+    const safeLimit = Number.isFinite(limit)
+      ? Math.max(1, Math.min(Math.trunc(limit), 500))
+      : 30;
+    const cleanTaskId = taskId?.trim();
+
+    const rows =
+      cleanTaskId !== undefined
+        ? this.dbManager.db
+            .query<RawEventRow, [string, string, number]>(
+              `SELECT * FROM task_events
+               WHERE project_id = ? AND task_id = ?
+               ORDER BY id DESC
+               LIMIT ?`
+            )
+            .all(projectId, cleanTaskId, safeLimit)
+        : this.dbManager.db
+            .query<RawEventRow, [string, number]>(
+              `SELECT * FROM task_events
+               WHERE project_id = ?
+               ORDER BY id DESC
+               LIMIT ?`
+            )
+            .all(projectId, safeLimit);
 
     return rows.map((row) => ({
       id: row.id,
@@ -509,6 +534,7 @@ export class TaskRepository {
       claimed_by: row.claimed_by,
       claimed_at: row.claimed_at,
       heartbeat_at: row.heartbeat_at,
+      lock_version: row.lock_version ?? 0,
       attempt_count: row.attempt_count,
       blocker_reason: row.blocker_reason,
       created_at: row.created_at,

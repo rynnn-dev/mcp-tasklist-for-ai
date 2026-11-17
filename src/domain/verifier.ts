@@ -11,21 +11,61 @@ const DEFAULT_PROGRESS_INTERVAL_MS = 1000;
 
 export function truncateOutputTail(
   text: string,
-  maxChars = MAX_VERIFICATION_OUTPUT_CHARS
+  maxChars = MAX_VERIFICATION_OUTPUT_CHARS,
+  priorOmittedChars = 0
 ): string {
-  if (text.length <= maxChars) {
+  if (priorOmittedChars === 0 && text.length <= maxChars) {
     return text;
   }
-  const omitted = text.length - maxChars;
-  return `...[truncated ${omitted} leading chars]...\n${text.slice(-maxChars)}`;
+  const omittedPrefix = (n: number) => `...[truncated ${n} leading chars]...\n`;
+  let totalOmitted = priorOmittedChars;
+  if (text.length > maxChars) {
+    totalOmitted += text.length - maxChars;
+  }
+  const banner = omittedPrefix(totalOmitted);
+  if (banner.length >= maxChars) {
+    return banner.slice(0, maxChars);
+  }
+  const allowedBody = maxChars - banner.length;
+  const actualOmitted = priorOmittedChars + Math.max(0, text.length - allowedBody);
+  const finalBanner = omittedPrefix(actualOmitted);
+  const finalBodyBudget = Math.max(0, maxChars - finalBanner.length);
+  return `${finalBanner}${text.slice(-finalBodyBudget)}`;
 }
 
-function appendBounded(current: string, chunk: string): string {
-  const combined = current + chunk;
+function appendBounded(
+  state: { text: string; dropped: number },
+  chunk: string
+): void {
+  const combined = state.text + chunk;
   if (combined.length <= MAX_STREAM_BUFFER_CHARS) {
-    return combined;
+    state.text = combined;
+    return;
   }
-  return combined.slice(-MAX_STREAM_BUFFER_CHARS);
+  state.dropped += combined.length - MAX_STREAM_BUFFER_CHARS;
+  state.text = combined.slice(-MAX_STREAM_BUFFER_CHARS);
+}
+
+function resolveVerificationShell(command: string): {
+  file: string;
+  args: string[];
+  useProcessGroup: boolean;
+  windowsVerbatimArguments?: boolean;
+} {
+  if (process.platform === "win32") {
+    const comspec = process.env.ComSpec?.trim() || "cmd.exe";
+    return {
+      file: comspec,
+      args: ["/d", "/s", "/c", `"${command}"`],
+      useProcessGroup: false,
+      windowsVerbatimArguments: true,
+    };
+  }
+  return {
+    file: "sh",
+    args: ["-c", command],
+    useProcessGroup: true,
+  };
 }
 
 async function runSingleCommand(
@@ -36,17 +76,20 @@ async function runSingleCommand(
   stepIndex: number,
   totalSteps: number,
   onProgress?: (update: VerificationProgressUpdate) => void | Promise<void>,
-  progressIntervalMs = DEFAULT_PROGRESS_INTERVAL_MS
+  progressIntervalMs = DEFAULT_PROGRESS_INTERVAL_MS,
+  signal?: AbortSignal
 ): Promise<VerificationStepResult> {
   const startedAt = Date.now();
   let timedOut = false;
-  let stdoutBuf = "";
-  let stderrBuf = "";
+  let aborted = false;
+  const stdoutState = { text: "", dropped: 0 };
+  const stderrState = { text: "", dropped: 0 };
+  let lastProgressPromise: Promise<void> = Promise.resolve();
 
-  const emitProgress = (phase: "start" | "tick" | "done") => {
-    if (!onProgress) return;
+  const emitProgress = (phase: "start" | "tick" | "done"): Promise<void> => {
+    if (!onProgress) return Promise.resolve();
     try {
-      void Promise.resolve(
+      const p = Promise.resolve(
         onProgress({
           tier,
           command,
@@ -58,34 +101,64 @@ async function runSingleCommand(
       ).catch(() => {
         // Ignore progress callback failures so verification never aborts
       });
+      lastProgressPromise = p;
+      return p;
     } catch {
-      // Ignore synchronous progress callback failures
+      return Promise.resolve();
     }
   };
+
+  if (signal?.aborted) {
+    return {
+      tier,
+      command,
+      exit_code: null,
+      timed_out: false,
+      passed: false,
+      duration_ms: 0,
+      output_snippet: "[aborted] Verification aborted before start.",
+    };
+  }
 
   emitProgress("start");
 
   return await new Promise<VerificationStepResult>((resolve) => {
-    const useProcessGroup = process.platform !== "win32";
-    const child = spawn("sh", ["-c", command], {
+    const shell = resolveVerificationShell(command);
+    const useProcessGroup = shell.useProcessGroup;
+    const child = spawn(shell.file, shell.args, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
       detached: useProcessGroup,
+      ...(shell.windowsVerbatimArguments
+        ? { windowsVerbatimArguments: true, windowsHide: true }
+        : {}),
     });
 
-    const killTree = (signal: NodeJS.Signals) => {
+    const killTree = (sig: NodeJS.Signals) => {
       if (!child.pid) return;
+      if (process.platform === "win32") {
+        try {
+          const killer = spawn("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+            stdio: "ignore",
+            windowsHide: true,
+          });
+          killer.unref();
+          return;
+        } catch {
+          // fall back to direct child kill
+        }
+      }
       if (useProcessGroup) {
         try {
-          process.kill(-child.pid, signal);
+          process.kill(-child.pid, sig);
           return;
         } catch {
           // fall back to direct child kill
         }
       }
       try {
-        child.kill(signal);
+        child.kill(sig);
       } catch {
         // ignore if already exited
       }
@@ -96,8 +169,31 @@ async function runSingleCommand(
     let hardCloseTimer: ReturnType<typeof setTimeout> | undefined;
     const progressTimer =
       onProgress && progressIntervalMs > 0
-        ? setInterval(() => emitProgress("tick"), progressIntervalMs)
+        ? setInterval(() => void emitProgress("tick"), progressIntervalMs)
         : undefined;
+
+    const cleanupStreams = () => {
+      try {
+        child.stdout?.removeAllListeners();
+        child.stdout?.destroy();
+      } catch {
+        // ignore
+      }
+      try {
+        child.stderr?.removeAllListeners();
+        child.stderr?.destroy();
+      } catch {
+        // ignore
+      }
+    };
+
+    const onAbort = () => {
+      aborted = true;
+      killTree("SIGTERM");
+      killGraceTimer = setTimeout(() => killTree("SIGKILL"), 200);
+      hardCloseTimer = setTimeout(() => finish(null), 1000);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
 
     const finish = (exitCode: number | null) => {
       if (settled) return;
@@ -106,35 +202,48 @@ async function runSingleCommand(
       if (progressTimer !== undefined) clearInterval(progressTimer);
       if (killGraceTimer !== undefined) clearTimeout(killGraceTimer);
       if (hardCloseTimer !== undefined) clearTimeout(hardCloseTimer);
+      signal?.removeEventListener("abort", onAbort);
+      cleanupStreams();
 
       const durationMs = Date.now() - startedAt;
       const segments: string[] = [];
-      if (stdoutBuf.trim()) {
-        segments.push(`[stdout]\n${stdoutBuf.trimEnd()}`);
+      if (stdoutState.text.trim()) {
+        segments.push(`[stdout]\n${stdoutState.text.trimEnd()}`);
       }
-      if (stderrBuf.trim()) {
-        segments.push(`[stderr]\n${stderrBuf.trimEnd()}`);
+      if (stderrState.text.trim()) {
+        segments.push(`[stderr]\n${stderrState.text.trimEnd()}`);
       }
       if (timedOut) {
         segments.push(
           `[timeout] Verification command exceeded ${timeoutMs}ms and was terminated.`
         );
+      } else if (aborted) {
+        segments.push("[aborted] Verification command was cancelled by client.");
       }
 
       const combined = segments.join("\n\n");
-      const passed = !timedOut && exitCode === 0;
+      const passed = !timedOut && !aborted && exitCode === 0;
+      const totalDropped = stdoutState.dropped + stderrState.dropped;
 
-      emitProgress("done");
-
-      resolve({
-        tier,
-        command,
-        exit_code: timedOut ? null : exitCode,
-        timed_out: timedOut,
-        passed,
-        duration_ms: durationMs,
-        output_snippet: truncateOutputTail(combined),
+      const donePromise = Promise.allSettled([
+        lastProgressPromise,
+        emitProgress("done"),
+      ]).then(() => {
+        resolve({
+          tier,
+          command,
+          exit_code: timedOut || aborted ? null : exitCode,
+          timed_out: timedOut,
+          passed,
+          duration_ms: durationMs,
+          output_snippet: truncateOutputTail(
+            combined,
+            MAX_VERIFICATION_OUTPUT_CHARS,
+            totalDropped
+          ),
+        });
       });
+      void donePromise;
     };
 
     const timeoutTimer = setTimeout(() => {
@@ -145,22 +254,27 @@ async function runSingleCommand(
       }, 200);
       // Failsafe in case an unkillable fd keeps stdio streams open
       hardCloseTimer = setTimeout(() => {
+        try {
+          child.unref();
+        } catch {
+          // ignore
+        }
         finish(null);
       }, 1000);
     }, timeoutMs);
 
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (chunk: string) => {
-      stdoutBuf = appendBounded(stdoutBuf, chunk);
+      appendBounded(stdoutState, chunk);
     });
 
     child.stderr?.setEncoding("utf8");
     child.stderr?.on("data", (chunk: string) => {
-      stderrBuf = appendBounded(stderrBuf, chunk);
+      appendBounded(stderrState, chunk);
     });
 
     child.on("error", (err) => {
-      stderrBuf = appendBounded(stderrBuf, `\nSpawn error: ${err.message}`);
+      appendBounded(stderrState, `\nSpawn error: ${err.message}`);
       finish(1);
     });
 
@@ -183,6 +297,7 @@ export async function runVerificationGate(params: {
   timeoutMs: number;
   onProgress?: (update: VerificationProgressUpdate) => void | Promise<void>;
   progressIntervalMs?: number;
+  signal?: AbortSignal;
 }): Promise<VerificationResult> {
   const queue: Array<{ tier: "task" | "project_default"; command: string }> = [];
 
@@ -217,7 +332,8 @@ export async function runVerificationGate(params: {
       i + 1,
       queue.length,
       params.onProgress,
-      params.progressIntervalMs
+      params.progressIntervalMs,
+      params.signal
     );
     steps.push(step);
     if (!step.passed) {
@@ -230,7 +346,7 @@ export async function runVerificationGate(params: {
     .map(
       (s) =>
         `=== [${s.tier}] ${s.command} (${s.passed ? "PASS" : "FAIL"}, exit=${
-          s.exit_code ?? "timeout"
+          s.timed_out ? "timeout" : (s.exit_code ?? "signal")
         }, ${s.duration_ms}ms) ===\n${s.output_snippet || "(no output)"}`
     )
     .join("\n\n");

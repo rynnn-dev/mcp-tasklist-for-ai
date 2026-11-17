@@ -18,9 +18,10 @@ export function resolveCentralDbPath(): string {
     return path.resolve(explicit);
   }
   const xdgData = process.env.XDG_DATA_HOME?.trim();
-  const baseDir = xdgData
-    ? path.resolve(xdgData)
-    : path.join(os.homedir(), ".local", "share");
+  const baseDir =
+    xdgData && path.isAbsolute(xdgData)
+      ? xdgData
+      : path.join(os.homedir(), ".local", "share");
   return path.join(baseDir, "moex", "tasklist.db");
 }
 
@@ -55,6 +56,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   claimed_by TEXT,
   claimed_at TEXT,
   heartbeat_at TEXT,
+  lock_version INTEGER NOT NULL DEFAULT 0,
   attempt_count INTEGER NOT NULL DEFAULT 0,
   blocker_reason TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
@@ -95,11 +97,13 @@ CREATE INDEX IF NOT EXISTS idx_task_events_project_task
   ON task_events(project_id, task_id, id);
 `;
 
-export const CURRENT_SCHEMA_VERSION = 2;
+export const CURRENT_SCHEMA_VERSION = 3;
 
 export class DatabaseManager {
   public readonly dbPath: string;
   public readonly db: Database;
+  private txDepth = 0;
+  private savepointSeq = 0;
 
   constructor(dbPath?: string) {
     this.dbPath = dbPath ?? resolveCentralDbPath();
@@ -107,7 +111,16 @@ export class DatabaseManager {
       mkdirSync(path.dirname(this.dbPath), { recursive: true });
     }
     this.db = new Database(this.dbPath, { create: true, strict: true });
-    this.configureAndMigrate();
+    try {
+      this.configureAndMigrate();
+    } catch (err) {
+      try {
+        this.db.close();
+      } catch {
+        // ignore close error on failed init
+      }
+      throw err;
+    }
   }
 
   public getSchemaVersion(): number {
@@ -118,11 +131,12 @@ export class DatabaseManager {
   }
 
   private configureAndMigrate(): void {
+    // Set busy_timeout before WAL pragma so concurrent DB creation waits cleanly
+    this.db.exec("PRAGMA busy_timeout = 5000;");
     if (this.dbPath !== ":memory:") {
       this.db.exec("PRAGMA journal_mode = WAL;");
     }
     this.db.exec("PRAGMA foreign_keys = ON;");
-    this.db.exec("PRAGMA busy_timeout = 5000;");
 
     const currentVersion = this.getSchemaVersion();
     if (currentVersion >= CURRENT_SCHEMA_VERSION) {
@@ -145,12 +159,17 @@ export class DatabaseManager {
         `);
         this.db.exec("PRAGMA user_version = 2;");
       }
+
+      if (versionInTx < 3) {
+        this.ensureTaskLockVersionColumn();
+        this.db.exec("PRAGMA user_version = 3;");
+      }
     });
   }
 
   /**
    * Ensures existing databases created prior to monotonic sequence tracking
-   * receive the projects.last_seq_num column and backfill their high-water mark.
+   * receive the projects.last_seq_num column and always backfill their high-water mark.
    */
   private ensureProjectSequenceColumn(): void {
     const columns = this.db
@@ -161,27 +180,59 @@ export class DatabaseManager {
       this.db.exec(
         "ALTER TABLE projects ADD COLUMN last_seq_num INTEGER NOT NULL DEFAULT 0;"
       );
-      this.db.exec(`
-        UPDATE projects
-        SET last_seq_num = MAX(
-          COALESCE((SELECT MAX(seq_num) FROM tasks WHERE tasks.project_id = projects.project_id), 0),
-          COALESCE(
-            (SELECT MAX(CAST(SUBSTR(task_id, 6) AS INTEGER))
-             FROM task_events
-             WHERE task_events.project_id = projects.project_id AND task_id GLOB 'TASK-[0-9]*'),
-            0
-          )
-        );
-      `);
+    }
+    this.db.exec(`
+      UPDATE projects
+      SET last_seq_num = MAX(
+        COALESCE(last_seq_num, 0),
+        COALESCE((SELECT MAX(seq_num) FROM tasks WHERE tasks.project_id = projects.project_id), 0),
+        COALESCE(
+          (SELECT MAX(CAST(SUBSTR(task_id, 6) AS INTEGER))
+           FROM task_events
+           WHERE task_events.project_id = projects.project_id
+             AND task_id GLOB 'TASK-[0-9]*'
+             AND SUBSTR(task_id, 6) NOT GLOB '*[^0-9]*'),
+          0
+        )
+      );
+    `);
+  }
+
+  private ensureTaskLockVersionColumn(): void {
+    const columns = this.db
+      .query<{ name: string }, []>("PRAGMA table_info(tasks)")
+      .all();
+    if (!columns.some((c) => c.name === "lock_version")) {
+      this.db.exec(
+        "ALTER TABLE tasks ADD COLUMN lock_version INTEGER NOT NULL DEFAULT 0;"
+      );
     }
   }
 
-  /**
-   * Executes fn inside a SQLite BEGIN IMMEDIATE transaction so concurrent
-   * processes/subagents serialize cleanly on write locks without SQLITE_BUSY races.
-   */
-  public withImmediateTransaction<T>(fn: () => T): T {
-    this.db.exec("BEGIN IMMEDIATE;");
+  private runInTransaction<T>(beginSql: string, fn: () => T): T {
+    if (this.txDepth > 0) {
+      const sp = `moex_sp_${++this.savepointSeq}`;
+      this.db.exec(`SAVEPOINT ${sp};`);
+      this.txDepth += 1;
+      try {
+        const result = fn();
+        this.db.exec(`RELEASE SAVEPOINT ${sp};`);
+        return result;
+      } catch (err) {
+        try {
+          this.db.exec(`ROLLBACK TO SAVEPOINT ${sp};`);
+          this.db.exec(`RELEASE SAVEPOINT ${sp};`);
+        } catch {
+          // ignore savepoint rollback error
+        }
+        throw err;
+      } finally {
+        this.txDepth -= 1;
+      }
+    }
+
+    this.db.exec(beginSql);
+    this.txDepth += 1;
     try {
       const result = fn();
       this.db.exec("COMMIT;");
@@ -193,7 +244,25 @@ export class DatabaseManager {
         // ignore rollback error if transaction already closed
       }
       throw err;
+    } finally {
+      this.txDepth -= 1;
     }
+  }
+
+  /**
+   * Executes fn inside a SQLite BEGIN IMMEDIATE transaction so concurrent
+   * processes/subagents serialize cleanly on write locks without SQLITE_BUSY races.
+   */
+  public withImmediateTransaction<T>(fn: () => T): T {
+    return this.runInTransaction("BEGIN IMMEDIATE;", fn);
+  }
+
+  /**
+   * Executes fn inside a read-consistent deferred snapshot transaction
+   * so read-only calls do not block concurrent WAL writers.
+   */
+  public withReadTransaction<T>(fn: () => T): T {
+    return this.runInTransaction("BEGIN DEFERRED;", fn);
   }
 
   public close(): void {

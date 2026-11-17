@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -10,6 +10,7 @@ import { TaskScheduler } from "../src/domain/scheduler.ts";
 import { createTasklistMcpServer } from "../src/mcp/server.ts";
 import { DatabaseManager } from "../src/storage/database.ts";
 import { TaskRepository } from "../src/storage/task-repository.ts";
+import { TasklistError } from "../src/types.ts";
 
 let tempRoot = "";
 let prevDbEnv: string | undefined;
@@ -155,6 +156,7 @@ describe("MCP Server Protocol E2E", () => {
         arguments: {
           project_path: projDir,
           task_id: "TASK-1",
+          agent_id: "claude-main",
           heartbeat: true,
           handoff_notes: "Server exported on port 3000",
         },
@@ -258,6 +260,7 @@ describe("MCP Server Protocol E2E", () => {
     const init = initProjectConfig({
       dir: projDir,
       projectName: "template-proj",
+      defaultVerificationCommand: "echo 'baseline-ok'",
     });
 
     const dbManager = new DatabaseManager(path.join(tempRoot, "central.db"));
@@ -288,7 +291,7 @@ describe("MCP Server Protocol E2E", () => {
           tasks: [
             {
               title: "Long verification task",
-              verification_command: "sleep 0.15 && echo 'verified'",
+              verification_command: "sleep 1.15 && echo 'verified'",
             },
           ],
         },
@@ -328,7 +331,7 @@ describe("MCP Server Protocol E2E", () => {
       expect(reclaimed.task.claimed_by).toBe("worker-b");
       expect(reclaimed.task.handoff_notes).toBe("Handing off to worker-b");
 
-      // Complete with onprogress to capture notifications/progress
+      // Complete with onprogress to capture 2-tier notifications/progress including periodic ticks
       const progressEvents: Array<{ progress: number; total?: number; message?: string }> = [];
       const done = parseToolText(
         (await client.callTool(
@@ -350,9 +353,25 @@ describe("MCP Server Protocol E2E", () => {
         )) as any
       );
       expect(done.task.status).toBe("done");
-      expect(progressEvents.length).toBeGreaterThanOrEqual(2);
+      expect(progressEvents.length).toBeGreaterThanOrEqual(5);
+      expect(progressEvents.some((p) => p.message?.includes("[1/2 task]"))).toBe(true);
+      expect(progressEvents.some((p) => p.message?.includes("[2/2 project_default]"))).toBe(true);
+      expect(progressEvents.some((p) => p.message?.includes(" tick ("))).toBe(true);
+      for (let i = 1; i < progressEvents.length; i++) {
+        expect(progressEvents[i]!.progress).toBeGreaterThan(
+          progressEvents[i - 1]!.progress
+        );
+      }
 
-      // Verify ResourceTemplates list & read by project_id
+      // Verify static resources + ResourceTemplates list & read by project_id
+      const staticResources = await client.listResources();
+      expect(staticResources.resources.map((r) => r.uri).sort()).toEqual([
+        "moex://project/context",
+        "moex://project/summary",
+        `moex://projects/${init.config.project_id}/context`,
+        `moex://projects/${init.config.project_id}/summary`,
+      ]);
+
       const templates = await client.listResourceTemplates();
       expect(templates.resourceTemplates.map((t) => t.uriTemplate).sort()).toEqual([
         "moex://projects/{project_id}/context",
@@ -386,6 +405,234 @@ describe("MCP Server Protocol E2E", () => {
         (fallbackSummary.contents[0] as { text: string }).text
       );
       expect(parsedFallback.project.project_id).toBe(init.config.project_id);
+
+      // Re-init with --new supersedes old project_id; old ResourceTemplate URI must be excluded & return PROJECT_NOT_INITIALIZED
+      const newInit = initProjectConfig({
+        dir: projDir,
+        projectName: "template-proj-v2",
+        newProject: true,
+      });
+      expect(newInit.config.project_id).not.toBe(init.config.project_id);
+
+      const afterRotateResources = await client.listResources();
+      expect(
+        afterRotateResources.resources.some((r) =>
+          r.uri.includes(init.config.project_id)
+        )
+      ).toBe(false);
+
+      const supersededRead = await client.readResource({
+        uri: `moex://projects/${init.config.project_id}/summary`,
+      });
+      const supersededPayload = JSON.parse(
+        (supersededRead.contents[0] as { text: string }).text
+      );
+      expect(supersededPayload.code).toBe("PROJECT_NOT_INITIALIZED");
+    } finally {
+      await client.close();
+      await server.close();
+      dbManager.close();
+    }
+  });
+
+  test("covers list_tasks filters, get_task_detail, VERIFICATION_FAILED, block_or_fail_task, and delete_task over MCP", async () => {
+    const projDir = path.join(tempRoot, "full-tools-proj");
+    mkdirSync(projDir, { recursive: true });
+    initProjectConfig({
+      dir: projDir,
+      projectName: "full-tools-proj",
+      maxAttempts: 3,
+    });
+
+    const dbManager = new DatabaseManager(path.join(tempRoot, "central.db"));
+    const scheduler = new TaskScheduler(new TaskRepository(dbManager));
+    const server = createTasklistMcpServer(scheduler, { projectDir: projDir });
+    const client = new Client({ name: "full-tools-client", version: "1.0.0" });
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([
+      server.connect(serverTransport),
+      client.connect(clientTransport),
+    ]);
+
+    try {
+      await client.callTool({
+        name: "create_tasks",
+        arguments: {
+          tasks: [
+            {
+              key: "base",
+              title: "Failing verification check",
+              category: "backend",
+              verification_command: "echo 'boom' >&2 && exit 1",
+            },
+            {
+              key: "child",
+              title: "Dependent frontend task",
+              category: "frontend",
+              depends_on: ["base"],
+            },
+          ],
+        },
+      });
+
+      // 1. list_tasks with filters
+      const actionable = parseToolText(
+        (await client.callTool({
+          name: "list_tasks",
+          arguments: { only_actionable: true, category: "backend" },
+        })) as any
+      );
+      expect(actionable.tasks.map((t: any) => t.id)).toEqual(["TASK-1"]);
+
+      // 2. get_task_detail includes dependents
+      const detail2 = parseToolText(
+        (await client.callTool({
+          name: "get_task_detail",
+          arguments: { task_id: "TASK-1" },
+        })) as any
+      );
+      expect(detail2.dependents.map((d: any) => d.id)).toEqual(["TASK-2"]);
+
+      // 3. Claim TASK-1 and fail Active Verification Gate over MCP
+      await client.callTool({
+        name: "claim_next_task",
+        arguments: { agent_id: "mcp-worker" },
+      });
+
+      const failedVerify = await client.callTool({
+        name: "complete_task",
+        arguments: {
+          task_id: "TASK-1",
+          agent_id: "mcp-worker",
+          verification_note: "Expecting failure",
+        },
+      });
+      expect(failedVerify.isError).toBe(true);
+      const failedPayload = parseToolText(failedVerify as any);
+      expect(failedPayload.code).toBe("VERIFICATION_FAILED");
+      expect(failedPayload.details.attempt_count).toBe(1);
+
+      // 4. block_or_fail_task: retry_later -> pending, then blocked -> blocked
+      const retried = parseToolText(
+        (await client.callTool({
+          name: "block_or_fail_task",
+          arguments: {
+            task_id: "TASK-1",
+            agent_id: "mcp-worker",
+            outcome: "retry_later",
+            reason: "Needs env fix",
+          },
+        })) as any
+      );
+      expect(retried.status).toBe("pending");
+      expect(retried.attempt_count).toBe(2);
+
+      const blocked = parseToolText(
+        (await client.callTool({
+          name: "block_or_fail_task",
+          arguments: {
+            task_id: "TASK-1",
+            agent_id: "mcp-worker",
+            outcome: "blocked",
+            reason: "Waiting for upstream key",
+          },
+        })) as any
+      );
+      expect(blocked.status).toBe("blocked");
+
+      // 5. delete_task refuses when dependents exist (force=false), succeeds with force=true
+      const delRefused = await client.callTool({
+        name: "delete_task",
+        arguments: { task_id: "TASK-1", force: false },
+      });
+      expect(delRefused.isError).toBe(true);
+      expect(parseToolText(delRefused as any).code).toBe("INVALID_STATE_TRANSITION");
+
+      const delForced = parseToolText(
+        (await client.callTool({
+          name: "delete_task",
+          arguments: { task_id: "TASK-1", force: true },
+        })) as any
+      );
+      expect(delForced.deleted_task_id).toBe("TASK-1");
+      expect(delForced.unlinked_dependents).toEqual(["TASK-2"]);
+    } finally {
+      await client.close();
+      await server.close();
+      dbManager.close();
+    }
+  });
+
+  test("rejects blank/empty Zod string arguments and handles corrupt/multi-project resource resolution cleanly", async () => {
+    const projCorrupt = path.join(tempRoot, "corrupt-proj");
+    const projValid = path.join(tempRoot, "valid-proj");
+    const uninitDir = path.join(tempRoot, "uninitialized-dir");
+    mkdirSync(projCorrupt, { recursive: true });
+    mkdirSync(projValid, { recursive: true });
+    mkdirSync(uninitDir, { recursive: true });
+
+    const initA = initProjectConfig({ dir: projCorrupt, projectName: "corrupt-proj" });
+    const initB = initProjectConfig({ dir: projValid, projectName: "valid-proj" });
+
+    const dbManager = new DatabaseManager(path.join(tempRoot, "central.db"));
+    const scheduler = new TaskScheduler(new TaskRepository(dbManager));
+    // Register both projects in SQLite (corrupt-proj first, valid-proj second)
+    scheduler.getProjectSummary(projCorrupt);
+    scheduler.getProjectSummary(projValid);
+
+    // Corrupt projA's .moex.json
+    writeFileSync(initA.config_path, "{invalid-json", "utf8");
+
+    // Direct target with corrupt config MUST throw INVALID_PROJECT_CONFIG (not silently fall back)
+    expect(() => scheduler.resolveResourceTargetProject(projCorrupt)).toThrow(
+      TasklistError
+    );
+
+    // Fallback with no preferredDir from an uninitialized cwd skips invalid projCorrupt and picks projValid
+    const prevCwd = process.cwd();
+    const prevMoexDir = process.env.MOEX_PROJECT_DIR;
+    const prevLegacyDir = process.env.MCP_TASKLIST_PROJECT_DIR;
+    delete process.env.MOEX_PROJECT_DIR;
+    delete process.env.MCP_TASKLIST_PROJECT_DIR;
+    process.chdir(uninitDir);
+    try {
+      const target = scheduler.resolveResourceTargetProject();
+      expect(target.projectPath).toBe(initB.project_root);
+    } finally {
+      process.chdir(prevCwd);
+      if (prevMoexDir !== undefined) process.env.MOEX_PROJECT_DIR = prevMoexDir;
+      if (prevLegacyDir !== undefined) process.env.MCP_TASKLIST_PROJECT_DIR = prevLegacyDir;
+    }
+
+    // Empty-string Zod inputs rejected by MCP tools
+    const server = createTasklistMcpServer(scheduler, { projectDir: projValid });
+    const client = new Client({ name: "zod-validation-client", version: "1.0.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([
+      server.connect(serverTransport),
+      client.connect(clientTransport),
+    ]);
+
+    try {
+      const badCalls = await Promise.all([
+        client.callTool({ name: "claim_next_task", arguments: { agent_id: "   " } }),
+        client.callTool({
+          name: "complete_task",
+          arguments: { task_id: "TASK-1", agent_id: "" },
+        }),
+        client.callTool({
+          name: "get_task_detail",
+          arguments: { task_id: "" },
+        }),
+        client.callTool({
+          name: "list_tasks",
+          arguments: { project_path: "" },
+        }),
+      ]);
+      for (const res of badCalls) {
+        expect(res.isError).toBe(true);
+      }
     } finally {
       await client.close();
       await server.close();

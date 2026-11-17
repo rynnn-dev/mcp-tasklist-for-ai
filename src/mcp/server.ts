@@ -94,8 +94,20 @@ export function createTasklistMcpServer(
     version: MOEX_VERSION,
   });
 
-  const resolvePath = (p?: string) => p?.trim() || defaults.projectDir;
-  const resolveCfg = (c?: string) => c?.trim() || defaults.configFileName;
+  const resolvePath = (p?: string) => {
+    if (p !== undefined && !p.trim()) {
+      throw new TasklistError("VALIDATION_ERROR", "project_path cannot be empty or whitespace.");
+    }
+    return p?.trim() || defaults.projectDir;
+  };
+  const resolveCfg = (c?: string) => {
+    if (c !== undefined && !c.trim()) {
+      throw new TasklistError("INVALID_PROJECT_CONFIG", "config_file cannot be empty or whitespace.");
+    }
+    return c?.trim() || defaults.configFileName;
+  };
+  const nonEmptyString = () =>
+    z.string().trim().min(1, "Value must not be empty or whitespace.");
 
   // 1. set_project_context
   server.registerTool(
@@ -171,7 +183,7 @@ export function createTasklistMcpServer(
                 .string()
                 .optional()
                 .describe("Temporary local key to reference this task inside depends_on within the same batch."),
-              title: z.string().min(1),
+              title: nonEmptyString(),
               description: z.string().optional(),
               category: z.string().optional(),
               priority: z.enum(TASK_PRIORITIES).optional(),
@@ -253,7 +265,7 @@ export function createTasklistMcpServer(
       inputSchema: {
         project_path: z.string().optional(),
         config_file: z.string().optional(),
-        task_id: z.string().min(1),
+        task_id: nonEmptyString(),
       },
     },
     async (args) =>
@@ -276,10 +288,9 @@ export function createTasklistMcpServer(
       inputSchema: {
         project_path: z.string().optional(),
         config_file: z.string().optional(),
-        agent_id: z
-          .string()
-          .min(1)
-          .describe("Unique identifier of the claiming agent or subagent (e.g. 'claude-main', 'worker-api')."),
+        agent_id: nonEmptyString().describe(
+          "Unique identifier of the claiming agent or subagent (e.g. 'claude-main', 'worker-api')."
+        ),
         category: z.string().optional(),
         ignore_file_locks: z
           .boolean()
@@ -309,15 +320,15 @@ export function createTasklistMcpServer(
     {
       title: "Update Task / Heartbeat / Unblock",
       description:
-        "Update task metadata, log incremental handoff_notes or modified_files, refresh lease heartbeat, mutate dependencies (with cycle validation), or reset a blocked/failed task back to pending.",
+        "Update task metadata, log incremental handoff_notes or modified_files, refresh lease heartbeat, release claim for handoff, mutate dependencies (with cycle validation), or reset a blocked/failed task back to pending.",
       inputSchema: {
         project_path: z.string().optional(),
         config_file: z.string().optional(),
-        task_id: z.string().min(1),
+        task_id: nonEmptyString(),
         agent_id: z
           .string()
           .optional()
-          .describe("Identifier of the agent performing the update (validated against claimed_by on active tasks)."),
+          .describe("Identifier of the agent performing the update (required to match claimed_by on active in_progress tasks unless reset_to_pending=true)."),
         actor: z.string().optional(),
         title: z.string().optional(),
         description: z.string().optional(),
@@ -347,8 +358,14 @@ export function createTasklistMcpServer(
       },
     },
     async (args) =>
-      safeToolCall(() =>
-        scheduler.updateTask(
+      safeToolCall(() => {
+        if (args.agent_id !== undefined && !args.agent_id.trim()) {
+          throw new TasklistError("VALIDATION_ERROR", "agent_id cannot be empty or whitespace.");
+        }
+        if (args.actor !== undefined && !args.actor.trim()) {
+          throw new TasklistError("VALIDATION_ERROR", "actor cannot be empty or whitespace.");
+        }
+        return scheduler.updateTask(
           resolvePath(args.project_path),
           args.task_id,
           {
@@ -369,10 +386,10 @@ export function createTasklistMcpServer(
             add_depends_on: args.add_depends_on,
             remove_depends_on: args.remove_depends_on,
           },
-          args.agent_id ?? args.actor,
+          args.agent_id?.trim() || args.actor?.trim() || undefined,
           resolveCfg(args.config_file)
-        )
-      )
+        );
+      })
   );
 
   // 7. complete_task
@@ -381,12 +398,15 @@ export function createTasklistMcpServer(
     {
       title: "Complete Task (Active Verification Gate)",
       description:
-        "Mark a task as done after enforcing verification_note and executing any configured verification_command and/or project default_verification_command. If verification fails, rejects completion, increments attempt_count, and returns command output for remediation.",
+        "Mark a claimed in_progress task as done after enforcing verification_note and executing any configured verification_command and/or project default_verification_command. If verification fails, rejects completion, increments attempt_count, and returns command output for remediation.",
       inputSchema: {
         project_path: z.string().optional(),
         config_file: z.string().optional(),
-        task_id: z.string().min(1),
-        agent_id: z.string().optional(),
+        task_id: nonEmptyString(),
+        agent_id: z
+          .string()
+          .optional()
+          .describe("Identifier of the agent that claimed the task (must match claimed_by on in_progress tasks)."),
         verification_note: z
           .string()
           .optional()
@@ -400,7 +420,11 @@ export function createTasklistMcpServer(
     },
     async (args, extra) =>
       safeToolCall(() => {
+        if (args.agent_id !== undefined && !args.agent_id.trim()) {
+          throw new TasklistError("VALIDATION_ERROR", "agent_id cannot be empty or whitespace.");
+        }
         const progressToken = extra._meta?.progressToken;
+        let progressSeq = 0;
         return scheduler.completeTask(
           resolvePath(args.project_path),
           args.task_id,
@@ -409,18 +433,28 @@ export function createTasklistMcpServer(
             verification_note: args.verification_note,
             handoff_notes: args.handoff_notes,
             modified_files: args.modified_files,
+            signal: extra.signal,
             on_progress:
               progressToken !== undefined
                 ? async (update) => {
-                    await extra.sendNotification({
-                      method: "notifications/progress",
-                      params: {
-                        progressToken,
-                        progress: update.step_index,
-                        total: update.total_steps,
-                        message: `[${update.tier}] ${update.phase} (${update.elapsed_ms}ms): ${update.command}`,
-                      },
-                    });
+                    if (extra.signal.aborted) return;
+                    progressSeq += 1;
+                    try {
+                      await extra.sendNotification({
+                        method: "notifications/progress",
+                        params: {
+                          progressToken,
+                          progress: progressSeq,
+                          message: `[${update.step_index}/${update.total_steps} ${update.tier}] ${update.phase} (${update.elapsed_ms}ms): ${update.command}`,
+                        },
+                      });
+                    } catch (notifyErr) {
+                      logStderr(
+                        `Failed to send progress notification: ${
+                          notifyErr instanceof Error ? notifyErr.message : String(notifyErr)
+                        }`
+                      );
+                    }
                   }
                 : undefined,
           },
@@ -439,17 +473,23 @@ export function createTasklistMcpServer(
       inputSchema: {
         project_path: z.string().optional(),
         config_file: z.string().optional(),
-        task_id: z.string().min(1),
-        agent_id: z.string().optional(),
+        task_id: nonEmptyString(),
+        agent_id: z
+          .string()
+          .optional()
+          .describe("Identifier of the agent performing the transition (must match claimed_by on in_progress tasks)."),
         outcome: z.enum(["blocked", "failed", "retry_later"]),
-        reason: z.string().min(1),
+        reason: nonEmptyString(),
         handoff_notes: z.string().optional(),
         modified_files: z.array(z.string()).optional(),
       },
     },
     async (args) =>
-      safeToolCall(() =>
-        scheduler.blockOrFailTask(
+      safeToolCall(() => {
+        if (args.agent_id !== undefined && !args.agent_id.trim()) {
+          throw new TasklistError("VALIDATION_ERROR", "agent_id cannot be empty or whitespace.");
+        }
+        return scheduler.blockOrFailTask(
           resolvePath(args.project_path),
           args.task_id,
           {
@@ -460,8 +500,8 @@ export function createTasklistMcpServer(
             modified_files: args.modified_files,
           },
           resolveCfg(args.config_file)
-        )
-      )
+        );
+      })
   );
 
   // 9. delete_task
@@ -474,7 +514,7 @@ export function createTasklistMcpServer(
       inputSchema: {
         project_path: z.string().optional(),
         config_file: z.string().optional(),
-        task_id: z.string().min(1),
+        task_id: nonEmptyString(),
         force: z.boolean().optional(),
         actor: z.string().optional(),
       },
@@ -512,6 +552,38 @@ export function createTasklistMcpServer(
       )
   );
 
+  const resourceErrorJson = (uriHref: string, err: unknown, projectId?: string) => {
+    const code = err instanceof TasklistError ? err.code : "INTERNAL_ERROR";
+    const msg = err instanceof Error ? err.message : String(err);
+    return {
+      contents: [
+        {
+          uri: uriHref,
+          mimeType: "application/json",
+          text: JSON.stringify(
+            {
+              initialized: false,
+              code,
+              ...(projectId !== undefined ? { project_id: projectId } : {}),
+              message: msg,
+            },
+            null,
+            2
+          ),
+        },
+      ],
+    };
+  };
+
+  const decodeTemplateVar = (raw: string | string[] | undefined): string => {
+    const first = Array.isArray(raw) ? raw[0] ?? "" : raw ?? "";
+    try {
+      return decodeURIComponent(first).trim();
+    } catch {
+      return first.trim();
+    }
+  };
+
   // Resource 1: Project Summary (with fallback to latest registered project)
   server.registerResource(
     "project-summary",
@@ -542,23 +614,7 @@ export function createTasklistMcpServer(
           ],
         };
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        return {
-          contents: [
-            {
-              uri: uri.href,
-              mimeType: "application/json",
-              text: JSON.stringify(
-                {
-                  initialized: false,
-                  message: msg,
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
+        return resourceErrorJson(uri.href, err);
       }
     }
   );
@@ -593,23 +649,7 @@ export function createTasklistMcpServer(
           ],
         };
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        return {
-          contents: [
-            {
-              uri: uri.href,
-              mimeType: "application/json",
-              text: JSON.stringify(
-                {
-                  initialized: false,
-                  message: msg,
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
+        return resourceErrorJson(uri.href, err);
       }
     }
   );
@@ -621,9 +661,9 @@ export function createTasklistMcpServer(
       list: async () => ({
         resources: scheduler
           .listRegisteredProjects()
-          .filter((p) => p.config_exists)
+          .filter((p) => p.config_valid)
           .map((p) => ({
-            uri: `moex://projects/${p.project_id}/summary`,
+            uri: `moex://projects/${encodeURIComponent(p.project_id)}/summary`,
             name: `${p.project_name} Summary`,
             description: `Tasklist summary for ${p.project_name} (${p.root_path})`,
             mimeType: "application/json",
@@ -637,8 +677,14 @@ export function createTasklistMcpServer(
       mimeType: "application/json",
     },
     async (uri, variables) => {
-      const rawId = variables.project_id;
-      const projectId = Array.isArray(rawId) ? rawId[0] ?? "" : rawId ?? "";
+      const projectId = decodeTemplateVar(variables.project_id);
+      if (!projectId) {
+        return resourceErrorJson(
+          uri.href,
+          new TasklistError("VALIDATION_ERROR", "project_id template parameter cannot be empty."),
+          projectId
+        );
+      }
       try {
         const summary = scheduler.getProjectSummaryById(projectId);
         return {
@@ -651,24 +697,7 @@ export function createTasklistMcpServer(
           ],
         };
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        return {
-          contents: [
-            {
-              uri: uri.href,
-              mimeType: "application/json",
-              text: JSON.stringify(
-                {
-                  initialized: false,
-                  project_id: projectId,
-                  message: msg,
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
+        return resourceErrorJson(uri.href, err, projectId);
       }
     }
   );
@@ -680,9 +709,9 @@ export function createTasklistMcpServer(
       list: async () => ({
         resources: scheduler
           .listRegisteredProjects()
-          .filter((p) => p.config_exists)
+          .filter((p) => p.config_valid)
           .map((p) => ({
-            uri: `moex://projects/${p.project_id}/context`,
+            uri: `moex://projects/${encodeURIComponent(p.project_id)}/context`,
             name: `${p.project_name} Context`,
             description: `Shared architecture context for ${p.project_name} (${p.root_path})`,
             mimeType: "application/json",
@@ -696,8 +725,14 @@ export function createTasklistMcpServer(
       mimeType: "application/json",
     },
     async (uri, variables) => {
-      const rawId = variables.project_id;
-      const projectId = Array.isArray(rawId) ? rawId[0] ?? "" : rawId ?? "";
+      const projectId = decodeTemplateVar(variables.project_id);
+      if (!projectId) {
+        return resourceErrorJson(
+          uri.href,
+          new TasklistError("VALIDATION_ERROR", "project_id template parameter cannot be empty."),
+          projectId
+        );
+      }
       try {
         const ctx = scheduler.getProjectContextById(projectId);
         return {
@@ -710,24 +745,7 @@ export function createTasklistMcpServer(
           ],
         };
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        return {
-          contents: [
-            {
-              uri: uri.href,
-              mimeType: "application/json",
-              text: JSON.stringify(
-                {
-                  initialized: false,
-                  project_id: projectId,
-                  message: msg,
-                },
-                null,
-                2
-              ),
-            },
-          ],
-        };
+        return resourceErrorJson(uri.href, err, projectId);
       }
     }
   );

@@ -86,6 +86,7 @@ export interface TaskRecord {
   claimed_by: string | null;
   claimed_at: string | null;
   heartbeat_at: string | null;
+  lock_version: number;
   attempt_count: number;
   blocker_reason: string;
   created_at: string;

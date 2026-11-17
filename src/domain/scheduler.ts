@@ -1,4 +1,4 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import {
   doRepoPathsConflict,
@@ -8,6 +8,7 @@ import {
 import { TaskRepository } from "../storage/task-repository.ts";
 import {
   PRIORITY_WEIGHT,
+  ProjectConfigSchema,
   ProjectSharedContextSchema,
   TasklistError,
   type ClaimNextResult,
@@ -83,6 +84,7 @@ export interface CompleteTaskParams {
   skip_verification_run?: boolean;
   on_progress?: (update: VerificationProgressUpdate) => void | Promise<void>;
   progress_interval_ms?: number;
+  signal?: AbortSignal;
 }
 
 export interface CompleteTaskResult {
@@ -126,6 +128,8 @@ export interface ProjectSummaryResult {
   recent_events: TaskEventRecord[];
 }
 
+const FORBIDDEN_CONTEXT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
+
 function isPlainObject(val: unknown): val is Record<string, unknown> {
   return typeof val === "object" && val !== null && !Array.isArray(val);
 }
@@ -140,10 +144,16 @@ function mergeSharedContext(
   }
   const merged: Record<string, unknown> = { ...existing };
   for (const [key, value] of Object.entries(patch)) {
-    if (value === undefined) continue;
+    if (value === undefined || FORBIDDEN_CONTEXT_KEYS.has(key)) continue;
     const prev = merged[key];
     if (isPlainObject(prev) && isPlainObject(value)) {
-      merged[key] = { ...prev, ...value };
+      const nested: Record<string, unknown> = { ...prev };
+      for (const [nk, nv] of Object.entries(value)) {
+        if (!FORBIDDEN_CONTEXT_KEYS.has(nk)) {
+          nested[nk] = nv;
+        }
+      }
+      merged[key] = nested;
     } else {
       merged[key] = value;
     }
@@ -174,6 +184,45 @@ export class TaskScheduler {
     const resolved = resolveProjectConfig(projectPath, configFileName);
     const project = this.repo.upsertProject(resolved);
     return { resolved, project };
+  }
+
+  private withReadProject<T>(
+    projectPath: string | undefined,
+    configFileName: string | undefined,
+    fn: (ctx: { resolved: ResolvedProject; project: ProjectRecord }) => T
+  ): T {
+    const resolved = resolveProjectConfig(projectPath, configFileName);
+    let needsSync = false;
+
+    const readAttempt = this.repo.withReadTransaction(() => {
+      try {
+        const existing = this.repo.getProject(resolved.config.project_id);
+        if (
+          existing.project_name !== resolved.config.project_name ||
+          existing.root_path !== resolved.project_root ||
+          existing.config_path !== resolved.config_path
+        ) {
+          needsSync = true;
+          return undefined as unknown as T;
+        }
+        return fn({ resolved, project: existing });
+      } catch (err) {
+        if (err instanceof TasklistError && err.code === "PROJECT_NOT_INITIALIZED") {
+          needsSync = true;
+          return undefined as unknown as T;
+        }
+        throw err;
+      }
+    });
+
+    if (!needsSync) {
+      return readAttempt;
+    }
+
+    return this.repo.withTransaction(() => {
+      const project = this.repo.upsertProject(resolved);
+      return fn({ resolved, project });
+    });
   }
 
   public setProjectContext(
@@ -213,10 +262,10 @@ export class TaskScheduler {
     projectPath?: string,
     configFileName?: string
   ): { project: ProjectRecord; config: ResolvedProject["config"] } {
-    return this.repo.withTransaction(() => {
-      const { resolved, project } = this.resolveAndSync(projectPath, configFileName);
-      return { project, config: resolved.config };
-    });
+    return this.withReadProject(projectPath, configFileName, ({ resolved, project }) => ({
+      project,
+      config: resolved.config,
+    }));
   }
 
   public createTasksBatch(
@@ -260,6 +309,12 @@ export class TaskScheduler {
             throw new TasklistError(
               "VALIDATION_ERROR",
               `Task "${title}" has an empty local key.`
+            );
+          }
+          if (/^TASK-\d+$/i.test(key)) {
+            throw new TasklistError(
+              "VALIDATION_ERROR",
+              `Local batch key "${key}" uses the reserved TASK-<number> ID format.`
             );
           }
           if (keyToId.has(key) || existingMap.has(key)) {
@@ -318,12 +373,14 @@ export class TaskScheduler {
       };
 
       for (const p of prepared) {
-        for (const depRef of p.input.depends_on ?? []) {
+        const uniqueDeps = Array.from(new Set(p.input.depends_on ?? []));
+        for (const depRef of uniqueDeps) {
           const depId = resolveRef(depRef, p.input.title);
           addEdge(p.id, depId);
         }
 
-        for (const blockedRef of p.input.blocks_task_ids ?? []) {
+        const uniqueBlockedRefs = Array.from(new Set(p.input.blocks_task_ids ?? []));
+        for (const blockedRef of uniqueBlockedRefs) {
           const blockedId = resolveRef(blockedRef, p.input.title);
           const existingBlocked = existingMap.get(blockedId);
           if (existingBlocked && existingBlocked.status === "done") {
@@ -336,7 +393,7 @@ export class TaskScheduler {
           if (existingBlocked && existingBlocked.status === "in_progress") {
             const list = suspendedTriggers.get(blockedId);
             if (list) {
-              list.push(p.id);
+              if (!list.includes(p.id)) list.push(p.id);
             } else {
               suspendedTriggers.set(blockedId, [p.id]);
             }
@@ -370,6 +427,7 @@ export class TaskScheduler {
           claimed_by: null,
           claimed_at: null,
           heartbeat_at: null,
+          lock_version: 0,
           attempt_count: 0,
           blocker_reason: "",
           created_at: now,
@@ -435,8 +493,7 @@ export class TaskScheduler {
     filter: ListTasksFilter = {},
     configFileName?: string
   ): TaskRecord[] {
-    return this.repo.withTransaction(() => {
-      const { resolved } = this.resolveAndSync(projectPath, configFileName);
+    return this.withReadProject(projectPath, configFileName, ({ resolved }) => {
       const tasks = this.repo.listTasksByProject(resolved.config.project_id);
       const taskMap = new Map(tasks.map((t) => [t.id, t]));
 
@@ -467,8 +524,7 @@ export class TaskScheduler {
     dependents: Array<{ id: string; title: string; status: TaskStatus }>;
     events: TaskEventRecord[];
   } {
-    return this.repo.withTransaction(() => {
-      const { resolved } = this.resolveAndSync(projectPath, configFileName);
+    return this.withReadProject(projectPath, configFileName, ({ resolved }) => {
       const projectId = resolved.config.project_id;
       const allTasks = this.repo.listTasksByProject(projectId);
       const taskMap = new Map(allTasks.map((t) => [t.id, t]));
@@ -678,6 +734,7 @@ export class TaskScheduler {
           claimed_by: cleanAgentId,
           claimed_at: nowIso,
           heartbeat_at: nowIso,
+          increment_lock_version: true,
           updated_at: nowIso,
         });
         this.repo.recordEvent(projectId, chosen.id, "TASK_CLAIMED", cleanAgentId, {
@@ -765,19 +822,27 @@ export class TaskScheduler {
         };
       }
 
-      if (blockedOrFailed.length === 0 && options.category) {
-        return {
-          outcome: "WAITING_ON_ACTIVE_TASKS",
-          task: null,
-          project_shared_context: project.shared_context,
-          prerequisite_handoffs: [],
-          stale_reclaimed_task_ids: staleReclaimedIds,
-          stale_failed_task_ids: staleFailedIds,
-          skipped_due_to_file_locks: skippedDueToLocks,
-          active_tasks: activeSummary,
-          blocked_or_failed_tasks: blockedOrFailed,
-          message: `No actionable pending tasks match category "${options.category}" right now; pending prerequisite/sibling tasks remain in other categories.`,
-        };
+      if (options.category) {
+        const hasActionableOutsideCategory = allTasks.some(
+          (t) =>
+            t.status === "pending" &&
+            t.category !== options.category &&
+            t.depends_on.every((depId) => taskMap.get(depId)?.status === "done")
+        );
+        if (blockedOrFailed.length === 0 || hasActionableOutsideCategory) {
+          return {
+            outcome: "WAITING_ON_ACTIVE_TASKS",
+            task: null,
+            project_shared_context: project.shared_context,
+            prerequisite_handoffs: [],
+            stale_reclaimed_task_ids: staleReclaimedIds,
+            stale_failed_task_ids: staleFailedIds,
+            skipped_due_to_file_locks: skippedDueToLocks,
+            active_tasks: activeSummary,
+            blocked_or_failed_tasks: blockedOrFailed,
+            message: `No actionable pending tasks match category "${options.category}" right now; pending prerequisite/sibling tasks remain in other categories.`,
+          };
+        }
       }
 
       return {
@@ -805,6 +870,13 @@ export class TaskScheduler {
     actor?: string,
     configFileName?: string
   ): TaskRecord {
+    if (patch.release_claim && patch.reset_to_pending) {
+      throw new TasklistError(
+        "VALIDATION_ERROR",
+        "Cannot set both release_claim=true and reset_to_pending=true in the same update_task call."
+      );
+    }
+
     const explicitActor = actor?.trim();
     const effectiveActor = explicitActor || "agent";
 
@@ -819,17 +891,41 @@ export class TaskScheduler {
         );
       }
 
+      if (existing.status === "done" && !patch.reset_to_pending) {
+        throw new TasklistError(
+          "INVALID_STATE_TRANSITION",
+          `Task "${taskId}" is already done and cannot be modified unless reset_to_pending=true is passed to reopen it.`
+        );
+      }
+
       if (
         !patch.reset_to_pending &&
         existing.status === "in_progress" &&
-        existing.claimed_by &&
-        explicitActor &&
-        existing.claimed_by !== explicitActor
+        existing.claimed_by
       ) {
-        throw new TasklistError(
-          "TASK_LOCKED",
-          `Task "${taskId}" is currently claimed by "${existing.claimed_by}", not "${explicitActor}". Pass reset_to_pending=true only if intentionally overriding a stuck claim.`
+        if (!explicitActor || existing.claimed_by !== explicitActor) {
+          throw new TasklistError(
+            "TASK_LOCKED",
+            `Task "${taskId}" is currently claimed by "${existing.claimed_by}", not "${explicitActor ?? "(unspecified)"}". Pass matching agent_id or reset_to_pending=true only if intentionally overriding a stuck claim.`
+          );
+        }
+      }
+
+      if (patch.reset_to_pending && existing.status === "done") {
+        const allTasksForReopen = this.repo.listTasksByProject(projectId);
+        const activeDependents = allTasksForReopen.filter(
+          (t) =>
+            t.depends_on.includes(taskId) &&
+            (t.status === "done" || t.status === "in_progress")
         );
+        if (activeDependents.length > 0) {
+          throw new TasklistError(
+            "INVALID_STATE_TRANSITION",
+            `Cannot reopen completed task "${taskId}" because downstream dependent(s) are already ${activeDependents
+              .map((d) => `${d.id} (${d.status})`)
+              .join(", ")}. Reopen downstream task(s) first.`
+          );
+        }
       }
 
       const now = new Date().toISOString();
@@ -891,7 +987,7 @@ export class TaskScheduler {
           updateFields.heartbeat_at = now;
         }
       }
-      if (patch.release_claim && !patch.reset_to_pending) {
+      if (patch.release_claim) {
         if (existing.status !== "in_progress") {
           throw new TasklistError(
             "INVALID_STATE_TRANSITION",
@@ -909,6 +1005,8 @@ export class TaskScheduler {
         updateFields.claimed_at = null;
         updateFields.heartbeat_at = null;
         updateFields.blocker_reason = "";
+        updateFields.verification_note = "";
+        updateFields.last_verification_output = "";
         updateFields.completed_at = null;
         if (patch.reset_attempts) {
           updateFields.attempt_count = 0;
@@ -927,7 +1025,7 @@ export class TaskScheduler {
         const taskMap = new Map(allTasks.map((t) => [t.id, t]));
         const allTaskIds = new Set(allTasks.map((t) => t.id));
         const removeSet = new Set(patch.remove_depends_on ?? []);
-        const addList = patch.add_depends_on ?? [];
+        const addList = Array.from(new Set(patch.add_depends_on ?? []));
 
         for (const depId of addList) {
           if (!allTaskIds.has(depId)) {
@@ -941,18 +1039,13 @@ export class TaskScheduler {
         const unfinishedAddedDeps = addList.filter(
           (depId) => taskMap.get(depId)?.status !== "done"
         );
-        if (unfinishedAddedDeps.length > 0 && !patch.reset_to_pending) {
-          if (existing.status === "done") {
-            throw new TasklistError(
-              "INVALID_STATE_TRANSITION",
-              `Cannot add unfinished prerequisite(s) (${unfinishedAddedDeps.join(
-                ", "
-              )}) to already-completed task "${taskId}". Pass reset_to_pending=true to reopen it first.`
-            );
-          }
-          if (existing.status === "in_progress" && !patch.release_claim) {
-            suspendedByAddedDeps = unfinishedAddedDeps;
-          }
+        if (
+          unfinishedAddedDeps.length > 0 &&
+          !patch.reset_to_pending &&
+          existing.status === "in_progress" &&
+          !patch.release_claim
+        ) {
+          suspendedByAddedDeps = unfinishedAddedDeps;
         }
 
         const currentEdges = this.repo.getAllDependencies(projectId);
@@ -1004,7 +1097,7 @@ export class TaskScheduler {
           { prerequisite_ids: suspendedByAddedDeps }
         );
       }
-      if (patch.release_claim && !patch.reset_to_pending) {
+      if (patch.release_claim) {
         this.repo.recordEvent(
           projectId,
           taskId,
@@ -1081,15 +1174,10 @@ export class TaskScheduler {
         );
       }
 
-      const normalizedModified =
+      const normalizedInputModified =
         params.modified_files !== undefined
-          ? Array.from(
-              new Set([
-                ...task.modified_files,
-                ...normalizeRepoPaths(resolved.project_root, params.modified_files),
-              ])
-            )
-          : task.modified_files;
+          ? normalizeRepoPaths(resolved.project_root, params.modified_files)
+          : undefined;
 
       this.repo.updateTaskRow(projectId, taskId, {
         heartbeat_at: new Date().toISOString(),
@@ -1101,8 +1189,12 @@ export class TaskScheduler {
         expectedStatus: task.status,
         expectedClaimedBy: task.claimed_by,
         expectedClaimedAt: task.claimed_at,
+        expectedLockVersion: task.lock_version,
+        expectedTaskCommand: task.verification_command,
+        expectedDefaultCommand: resolved.config.default_verification_command,
+        expectedAutoRunVerification: resolved.config.auto_run_verification,
         verificationNote,
-        normalizedModified,
+        normalizedInputModified,
       };
     });
 
@@ -1123,6 +1215,7 @@ export class TaskScheduler {
         defaultCommand: preflight.resolved.config.default_verification_command,
         timeoutMs: preflight.resolved.config.verification_timeout_ms,
         progressIntervalMs: params.progress_interval_ms,
+        signal: params.signal,
         onProgress: async (update) => {
           if (update.phase === "tick") {
             try {
@@ -1135,7 +1228,7 @@ export class TaskScheduler {
                   current &&
                   current.status === "in_progress" &&
                   current.claimed_by === preflight.expectedClaimedBy &&
-                  current.claimed_at === preflight.expectedClaimedAt
+                  current.lock_version === preflight.expectedLockVersion
                 ) {
                   this.repo.updateTaskRow(
                     preflight.resolved.config.project_id,
@@ -1181,7 +1274,8 @@ export class TaskScheduler {
 
       if (
         currentTask.claimed_by !== preflight.expectedClaimedBy ||
-        currentTask.claimed_at !== preflight.expectedClaimedAt
+        currentTask.claimed_at !== preflight.expectedClaimedAt ||
+        currentTask.lock_version !== preflight.expectedLockVersion
       ) {
         throw new TasklistError(
           "TASK_LOCKED",
@@ -1199,18 +1293,44 @@ export class TaskScheduler {
         );
       }
 
+      // Detect verification command or baseline config drift during Phase 2
+      const latestConfig = resolveProjectConfig(
+        preflight.resolved.project_root,
+        preflight.resolved.config_file_name
+      ).config;
+      if (
+        currentTask.verification_command !== preflight.expectedTaskCommand ||
+        latestConfig.default_verification_command !== preflight.expectedDefaultCommand ||
+        latestConfig.auto_run_verification !== preflight.expectedAutoRunVerification
+      ) {
+        throw new TasklistError(
+          "INVALID_STATE_TRANSITION",
+          `Verification command or project verification settings changed while verification was running for "${taskId}". Re-run complete_task so the latest command is verified.`
+        );
+      }
+
+      const mergedModified =
+        preflight.normalizedInputModified !== undefined
+          ? Array.from(
+              new Set([
+                ...currentTask.modified_files,
+                ...preflight.normalizedInputModified,
+              ])
+            )
+          : currentTask.modified_files;
+
       const now = new Date().toISOString();
 
       if (!verification.passed) {
         const nextAttempts = currentTask.attempt_count + 1;
-        const reachedLimit = nextAttempts >= preflight.resolved.config.max_attempts;
-        const failReason = `Active verification gate failed (attempt ${nextAttempts}/${preflight.resolved.config.max_attempts}).`;
+        const reachedLimit = nextAttempts >= latestConfig.max_attempts;
+        const failReason = `Active verification gate failed (attempt ${nextAttempts}/${latestConfig.max_attempts}).`;
 
         this.repo.updateTaskRow(projectId, taskId, {
           status: reachedLimit ? "failed" : currentTask.status,
           attempt_count: nextAttempts,
           last_verification_output: verification.combined_output,
-          modified_files: preflight.normalizedModified,
+          modified_files: mergedModified,
           handoff_notes:
             params.handoff_notes !== undefined
               ? params.handoff_notes.trim()
@@ -1224,7 +1344,7 @@ export class TaskScheduler {
 
         this.repo.recordEvent(projectId, taskId, "VERIFICATION_FAILED", actor, {
           attempt_count: nextAttempts,
-          max_attempts: preflight.resolved.config.max_attempts,
+          max_attempts: latestConfig.max_attempts,
           transitioned_to_failed: reachedLimit,
         });
 
@@ -1240,7 +1360,7 @@ export class TaskScheduler {
             {
               task_id: taskId,
               attempt_count: nextAttempts,
-              max_attempts: preflight.resolved.config.max_attempts,
+              max_attempts: latestConfig.max_attempts,
               status: reachedLimit ? "failed" : currentTask.status,
               verification,
             }
@@ -1256,7 +1376,7 @@ export class TaskScheduler {
           params.handoff_notes !== undefined
             ? params.handoff_notes.trim()
             : currentTask.handoff_notes,
-        modified_files: preflight.normalizedModified,
+        modified_files: mergedModified,
         claimed_by: null,
         claimed_at: null,
         heartbeat_at: null,
@@ -1267,7 +1387,7 @@ export class TaskScheduler {
 
       this.repo.recordEvent(projectId, taskId, "TASK_COMPLETED", actor, {
         verification_steps_run: verification.steps.length,
-        modified_files_count: preflight.normalizedModified.length,
+        modified_files_count: mergedModified.length,
       });
 
       const allTasksAfter = this.repo.listTasksByProject(projectId);
@@ -1334,16 +1454,19 @@ export class TaskScheduler {
           `Task "${taskId}" is already done. Use update_task(reset_to_pending=true) to reopen it.`
         );
       }
-      if (
-        existing.status === "in_progress" &&
-        existing.claimed_by &&
-        cleanAgentId &&
-        existing.claimed_by !== cleanAgentId
-      ) {
-        throw new TasklistError(
-          "TASK_LOCKED",
-          `Task "${taskId}" is currently claimed by "${existing.claimed_by}", not "${cleanAgentId}".`
-        );
+      if (existing.status === "in_progress" && existing.claimed_by) {
+        if (!cleanAgentId) {
+          throw new TasklistError(
+            "TASK_LOCKED",
+            `Task "${taskId}" is currently claimed by "${existing.claimed_by}". Provide matching agent_id to block or fail this task.`
+          );
+        }
+        if (existing.claimed_by !== cleanAgentId) {
+          throw new TasklistError(
+            "TASK_LOCKED",
+            `Task "${taskId}" is currently claimed by "${existing.claimed_by}", not "${cleanAgentId}".`
+          );
+        }
       }
 
       const now = new Date().toISOString();
@@ -1409,6 +1532,7 @@ export class TaskScheduler {
     actor = "agent",
     configFileName?: string
   ): { deleted_task_id: string; unlinked_dependents: string[] } {
+    const cleanActor = actor?.trim() || "agent";
     return this.repo.withTransaction(() => {
       const { resolved } = this.resolveAndSync(projectPath, configFileName);
       const projectId = resolved.config.project_id;
@@ -1439,7 +1563,7 @@ export class TaskScheduler {
       }
 
       this.repo.deleteTaskById(projectId, taskId);
-      this.repo.recordEvent(projectId, taskId, "TASK_DELETED", actor, {
+      this.repo.recordEvent(projectId, taskId, "TASK_DELETED", cleanActor, {
         title: existing.title,
         force,
         unlinked_dependents: dependentIds,
@@ -1451,9 +1575,37 @@ export class TaskScheduler {
 
   public unlockTasks(
     projectPath: string | undefined,
-    options: { taskId?: string; allStale?: boolean; actor?: string; configFileName?: string }
+    options: {
+      taskId?: string;
+      allStale?: boolean;
+      all?: boolean;
+      actor?: string;
+      configFileName?: string;
+    }
   ): { unlocked_task_ids: string[] } {
     const actor = options.actor?.trim() || "cli";
+    const hasTaskId = options.taskId !== undefined;
+    const cleanTaskId = options.taskId?.trim();
+    if (hasTaskId && !cleanTaskId) {
+      throw new TasklistError("VALIDATION_ERROR", "--task cannot be empty.");
+    }
+
+    const modeCount = [hasTaskId, Boolean(options.allStale), Boolean(options.all)].filter(
+      Boolean
+    ).length;
+    if (modeCount === 0) {
+      throw new TasklistError(
+        "VALIDATION_ERROR",
+        "Specify an explicit unlock mode: --task <id>, --all-stale, or --all."
+      );
+    }
+    if (modeCount > 1) {
+      throw new TasklistError(
+        "VALIDATION_ERROR",
+        "Unlock modes --task, --all-stale, and --all are mutually exclusive."
+      );
+    }
+
     return this.repo.withTransaction(() => {
       const { resolved } = this.resolveAndSync(projectPath, options.configFileName);
       const projectId = resolved.config.project_id;
@@ -1462,12 +1614,12 @@ export class TaskScheduler {
       const allTasks = this.repo.listTasksByProject(projectId);
       const unlocked: string[] = [];
 
-      if (options.taskId) {
-        const target = allTasks.find((t) => t.id === options.taskId);
+      if (cleanTaskId) {
+        const target = allTasks.find((t) => t.id === cleanTaskId);
         if (!target) {
           throw new TasklistError(
             "TASK_NOT_FOUND",
-            `Task "${options.taskId}" not found in project "${resolved.config.project_name}".`
+            `Task "${cleanTaskId}" not found in project "${resolved.config.project_name}".`
           );
         }
         if (target.status === "done") {
@@ -1507,7 +1659,8 @@ export class TaskScheduler {
           });
           this.repo.recordEvent(projectId, task.id, "TASK_CLI_UNLOCKED", actor, {
             previous_owner: task.claimed_by,
-            all_stale: options.allStale ?? false,
+            all_stale: Boolean(options.allStale),
+            all: Boolean(options.all),
           });
           unlocked.push(task.id);
         }
@@ -1521,8 +1674,7 @@ export class TaskScheduler {
     projectPath: string | undefined,
     configFileName?: string
   ): ProjectSummaryResult {
-    return this.repo.withTransaction(() => {
-      const { resolved, project } = this.resolveAndSync(projectPath, configFileName);
+    return this.withReadProject(projectPath, configFileName, ({ resolved, project }) => {
       const tasks = this.repo.listTasksByProject(resolved.config.project_id);
       const taskMap = new Map(tasks.map((t) => [t.id, t]));
       const nowMs = Date.now();
@@ -1591,12 +1743,28 @@ export class TaskScheduler {
     });
   }
 
-  public listRegisteredProjects(): Array<ProjectRecord & { config_exists: boolean }> {
-    return this.repo.withTransaction(() => {
-      return this.repo.listProjects().map((p) => ({
-        ...p,
-        config_exists: existsSync(p.config_path),
-      }));
+  public listRegisteredProjects(): Array<
+    ProjectRecord & { config_exists: boolean; config_valid: boolean }
+  > {
+    return this.repo.withReadTransaction(() => {
+      return this.repo.listProjects().map((p) => {
+        const configExists = existsSync(p.config_path);
+        let configValid = false;
+        if (configExists) {
+          try {
+            const rawJson = JSON.parse(readFileSync(p.config_path, "utf8"));
+            const parsed = ProjectConfigSchema.safeParse(rawJson);
+            configValid = parsed.success && parsed.data.project_id === p.project_id;
+          } catch {
+            configValid = false;
+          }
+        }
+        return {
+          ...p,
+          config_exists: configExists,
+          config_valid: configValid,
+        };
+      });
     });
   }
 
@@ -1633,18 +1801,18 @@ export class TaskScheduler {
     project: ProjectRecord;
     events: TaskEventRecord[];
   } {
-    return this.repo.withTransaction(() => {
-      const { resolved, project } = this.resolveAndSync(
-        projectPath,
-        options.configFileName
-      );
-      const events = this.repo.getProjectEvents(
-        resolved.config.project_id,
-        options.limit ?? 30,
-        options.taskId
-      );
-      return { project, events };
-    });
+    return this.withReadProject(
+      projectPath,
+      options.configFileName,
+      ({ resolved, project }) => {
+        const events = this.repo.getProjectEvents(
+          resolved.config.project_id,
+          options.limit ?? 30,
+          options.taskId
+        );
+        return { project, events };
+      }
+    );
   }
 
   public resolveResourceTargetProject(
@@ -1658,10 +1826,19 @@ export class TaskScheduler {
         configFileName: resolved.config_file_name,
       };
     } catch (err) {
-      if (preferredDir) {
+      const hasEnvDir = Boolean(
+        process.env.MOEX_PROJECT_DIR?.trim() ||
+          process.env.MCP_TASKLIST_PROJECT_DIR?.trim()
+      );
+      if (
+        preferredDir !== undefined ||
+        hasEnvDir ||
+        !(err instanceof TasklistError) ||
+        err.code !== "PROJECT_NOT_INITIALIZED"
+      ) {
         throw err;
       }
-      const registered = this.listRegisteredProjects().find((p) => p.config_exists);
+      const registered = this.listRegisteredProjects().find((p) => p.config_valid);
       if (!registered) {
         throw err;
       }
@@ -1672,34 +1849,37 @@ export class TaskScheduler {
     }
   }
 
-  public getProjectSummaryById(projectId: string): ProjectSummaryResult {
-    const project = this.repo.getProject(projectId);
+  private resolveRegisteredProjectConfig(projectId: string): ResolvedProject {
+    const project = this.repo.withReadTransaction(() => this.repo.getProject(projectId));
     if (!existsSync(project.config_path)) {
       throw new TasklistError(
         "PROJECT_NOT_INITIALIZED",
         `Config file for project "${project.project_name}" (${projectId}) is missing at "${project.config_path}".`
       );
     }
-    return this.getProjectSummary(
-      project.root_path,
+    const resolved = resolveProjectConfig(
+      path.dirname(project.config_path),
       path.basename(project.config_path)
     );
+    if (resolved.config.project_id !== projectId) {
+      throw new TasklistError(
+        "PROJECT_NOT_INITIALIZED",
+        `Config file "${project.config_path}" now belongs to project "${resolved.config.project_id}", superseding "${projectId}".`
+      );
+    }
+    return resolved;
+  }
+
+  public getProjectSummaryById(projectId: string): ProjectSummaryResult {
+    const resolved = this.resolveRegisteredProjectConfig(projectId);
+    return this.getProjectSummary(resolved.project_root, resolved.config_file_name);
   }
 
   public getProjectContextById(projectId: string): {
     project: ProjectRecord;
     config: ResolvedProject["config"];
   } {
-    const project = this.repo.getProject(projectId);
-    if (!existsSync(project.config_path)) {
-      throw new TasklistError(
-        "PROJECT_NOT_INITIALIZED",
-        `Config file for project "${project.project_name}" (${projectId}) is missing at "${project.config_path}".`
-      );
-    }
-    return this.getProjectContext(
-      project.root_path,
-      path.basename(project.config_path)
-    );
+    const resolved = this.resolveRegisteredProjectConfig(projectId);
+    return this.getProjectContext(resolved.project_root, resolved.config_file_name);
   }
 }

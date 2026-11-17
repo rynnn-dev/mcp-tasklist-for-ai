@@ -1,7 +1,9 @@
 import { randomUUID } from "node:crypto";
 import {
   existsSync,
+  lstatSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   renameSync,
   statSync,
@@ -48,12 +50,17 @@ export interface InitProjectResult {
  * (no path separators or directory traversal).
  */
 export function sanitizeConfigFileName(raw?: string): string {
-  const candidate = (
-    raw ??
-    process.env.MOEX_CONFIG ??
-    process.env.MCP_TASKLIST_CONFIG ??
-    DEFAULT_CONFIG_FILENAME
-  ).trim();
+  if (raw !== undefined && !raw.trim()) {
+    throw new TasklistError(
+      "INVALID_PROJECT_CONFIG",
+      `Invalid config filename: "${raw}".`
+    );
+  }
+  const candidate =
+    raw?.trim() ||
+    process.env.MOEX_CONFIG?.trim() ||
+    process.env.MCP_TASKLIST_CONFIG?.trim() ||
+    DEFAULT_CONFIG_FILENAME;
   if (!candidate || candidate === "." || candidate === "..") {
     throw new TasklistError(
       "INVALID_PROJECT_CONFIG",
@@ -197,6 +204,14 @@ export function initProjectConfig(options: InitProjectOptions): InitProjectResul
       );
     }
 
+    if (options.force && !options.newProject && !existingConfig) {
+      throw new TasklistError(
+        "INVALID_PROJECT_CONFIG",
+        `Existing project config at "${configPath}" is corrupt or invalid; refusing to silently rotate project_id with --force. Fix the JSON file or pass --new to start a new project_id.`,
+        { config_path: configPath }
+      );
+    }
+
     // --force without --new keeps existing valid project_id so tasks remain linked
     if (options.force && !options.newProject && existingConfig) {
       const updatedConfig = ProjectConfigSchema.parse({
@@ -206,7 +221,7 @@ export function initProjectConfig(options: InitProjectOptions): InitProjectResul
         created_at: existingConfig.created_at,
         default_verification_command:
           options.defaultVerificationCommand !== undefined
-            ? options.defaultVerificationCommand
+            ? options.defaultVerificationCommand?.trim() || null
             : existingConfig.default_verification_command,
         auto_run_verification:
           options.autoRunVerification ?? existingConfig.auto_run_verification,
@@ -238,7 +253,8 @@ export function initProjectConfig(options: InitProjectOptions): InitProjectResul
     project_id: randomUUID(),
     project_name: options.projectName?.trim() || path.basename(projectRoot) || "project",
     created_at: new Date().toISOString(),
-    default_verification_command: options.defaultVerificationCommand ?? null,
+    default_verification_command:
+      options.defaultVerificationCommand?.trim() || null,
     auto_run_verification: options.autoRunVerification ?? true,
     verification_timeout_ms: options.verificationTimeoutMs ?? 60000,
     max_attempts: options.maxAttempts ?? 3,
@@ -352,27 +368,6 @@ export function resolveProjectConfig(
   );
 }
 
-/**
- * Resolves the canonical filesystem path for absPath by finding the deepest existing
- * ancestor via realpathSync and reattaching any not-yet-created trailing segments.
- */
-function resolveThroughExistingAncestor(absPath: string): string {
-  const trailing: string[] = [];
-  let cursor = path.resolve(absPath);
-
-  while (!existsSync(cursor)) {
-    const parent = path.dirname(cursor);
-    if (parent === cursor) {
-      return cursor;
-    }
-    trailing.unshift(path.basename(cursor));
-    cursor = parent;
-  }
-
-  const realBase = realpathSync(cursor);
-  return trailing.length > 0 ? path.join(realBase, ...trailing) : realBase;
-}
-
 function isEscapingRelativePath(rel: string): boolean {
   return (
     rel === "" ||
@@ -384,8 +379,132 @@ function isEscapingRelativePath(rel: string): boolean {
 }
 
 /**
- * Normalizes file paths to clean relative POSIX paths rooted at projectRoot.
- * Rejects both lexical path traversal and symlinks pointing outside projectRoot.
+ * Resolves a symlink (including dangling symlinks) through up to 16 hops and
+ * throws INVALID_PATH if any symlink target resolves outside realRoot.
+ */
+function resolveSymlinkSafe(
+  linkPath: string,
+  realRoot: string,
+  rawInput: string,
+  projectRoot: string
+): string {
+  let current = linkPath;
+  for (let hop = 0; hop < 16; hop++) {
+    let st;
+    try {
+      st = lstatSync(current);
+    } catch {
+      // Target of dangling symlink does not exist; resolve through deepest existing ancestor
+      const trailing: string[] = [];
+      let ancestor = path.resolve(current);
+      while (true) {
+        try {
+          const ast = lstatSync(ancestor);
+          if (ast.isSymbolicLink()) {
+            const target = path.resolve(
+              path.dirname(ancestor),
+              readlinkSync(ancestor)
+            );
+            ancestor = target;
+            continue;
+          }
+          const realAncestor = realpathSync(ancestor);
+          const finalPath =
+            trailing.length > 0
+              ? path.join(realAncestor, ...trailing)
+              : realAncestor;
+          if (isEscapingRelativePath(path.relative(realRoot, finalPath))) {
+            throw new TasklistError(
+              "INVALID_PATH",
+              `File path "${rawInput}" resolves via symlink outside project root "${projectRoot}".`
+            );
+          }
+          return finalPath;
+        } catch (err) {
+          if (err instanceof TasklistError) throw err;
+          const parent = path.dirname(ancestor);
+          if (parent === ancestor) {
+            throw new TasklistError(
+              "INVALID_PATH",
+              `File path "${rawInput}" resolves via symlink outside project root "${projectRoot}".`
+            );
+          }
+          trailing.unshift(path.basename(ancestor));
+          ancestor = parent;
+        }
+      }
+    }
+
+    if (!st.isSymbolicLink()) {
+      const realResolved = realpathSync(current);
+      if (isEscapingRelativePath(path.relative(realRoot, realResolved))) {
+        throw new TasklistError(
+          "INVALID_PATH",
+          `File path "${rawInput}" resolves via symlink outside project root "${projectRoot}".`
+        );
+      }
+      return realResolved;
+    }
+
+    const linkTarget = readlinkSync(current);
+    current = path.resolve(path.dirname(current), linkTarget);
+    if (isEscapingRelativePath(path.relative(realRoot, current))) {
+      throw new TasklistError(
+        "INVALID_PATH",
+        `File path "${rawInput}" resolves via symlink outside project root "${projectRoot}".`
+      );
+    }
+  }
+
+  throw new TasklistError(
+    "INVALID_PATH",
+    `File path "${rawInput}" exceeded maximum symlink depth.`
+  );
+}
+
+/**
+ * Resolves relative POSIX path segment-by-segment from realRoot using lstatSync
+ * so existing symlinks, dangling symlinks, and internal aliases resolve canonically.
+ */
+function resolveCanonicalRepoPath(
+  projectRoot: string,
+  realRoot: string,
+  relSegments: readonly string[],
+  rawInput: string
+): string {
+  let cursor = realRoot;
+
+  for (let i = 0; i < relSegments.length; i++) {
+    const seg = relSegments[i]!;
+    const nextPath = path.join(cursor, seg);
+    let st;
+    try {
+      st = lstatSync(nextPath);
+    } catch {
+      cursor = path.join(cursor, ...relSegments.slice(i));
+      break;
+    }
+
+    if (st.isSymbolicLink()) {
+      cursor = resolveSymlinkSafe(nextPath, realRoot, rawInput, projectRoot);
+    } else {
+      cursor = nextPath;
+    }
+  }
+
+  const finalRel = path.relative(realRoot, cursor);
+  if (isEscapingRelativePath(finalRel)) {
+    throw new TasklistError(
+      "INVALID_PATH",
+      `File path "${rawInput}" escapes project root "${projectRoot}" or refers to root itself.`
+    );
+  }
+  return finalRel.split(path.sep).join("/");
+}
+
+/**
+ * Normalizes file paths to clean canonical relative POSIX paths rooted at projectRoot.
+ * Normalizes Windows backslashes, rejects null bytes, lexical traversals, and external symlinks.
  */
 export function normalizeRepoPaths(
   projectRoot: string,
@@ -393,35 +512,55 @@ export function normalizeRepoPaths(
 ): string[] {
   const seen = new Set<string>();
   const normalized: string[] = [];
-  const realRoot = existsSync(projectRoot)
-    ? realpathSync(projectRoot)
-    : path.resolve(projectRoot);
+  const resolvedRoot = path.resolve(projectRoot);
+  const realRoot = existsSync(resolvedRoot)
+    ? realpathSync(resolvedRoot)
+    : resolvedRoot;
 
   for (const raw of paths) {
-    const trimmed = raw.trim();
+    if (raw.includes("\0")) {
+      throw new TasklistError(
+        "INVALID_PATH",
+        `File path contains null byte.`
+      );
+    }
+    const trimmed = raw.trim().replace(/\\/g, "/");
     if (!trimmed) continue;
 
-    const absTarget = path.isAbsolute(trimmed)
-      ? path.resolve(trimmed)
-      : path.resolve(projectRoot, trimmed);
-    const lexicalRel = path.relative(projectRoot, absTarget);
-    if (isEscapingRelativePath(lexicalRel)) {
-      throw new TasklistError(
-        "INVALID_PATH",
-        `File path "${raw}" escapes project root "${projectRoot}" or refers to root itself.`
-      );
+    let lexicalRel: string;
+    if (path.isAbsolute(trimmed)) {
+      const absTarget = path.resolve(trimmed);
+      const fromResolved = path.relative(resolvedRoot, absTarget);
+      const fromReal = path.relative(realRoot, absTarget);
+      if (!isEscapingRelativePath(fromResolved)) {
+        lexicalRel = fromResolved;
+      } else if (!isEscapingRelativePath(fromReal)) {
+        lexicalRel = fromReal;
+      } else {
+        throw new TasklistError(
+          "INVALID_PATH",
+          `File path "${raw}" escapes project root "${projectRoot}" or refers to root itself.`
+        );
+      }
+    } else {
+      const absTarget = path.resolve(resolvedRoot, trimmed);
+      lexicalRel = path.relative(resolvedRoot, absTarget);
+      if (isEscapingRelativePath(lexicalRel)) {
+        throw new TasklistError(
+          "INVALID_PATH",
+          `File path "${raw}" escapes project root "${projectRoot}" or refers to root itself.`
+        );
+      }
     }
 
-    const realTarget = resolveThroughExistingAncestor(absTarget);
-    const realRel = path.relative(realRoot, realTarget);
-    if (isEscapingRelativePath(realRel)) {
-      throw new TasklistError(
-        "INVALID_PATH",
-        `File path "${raw}" resolves via symlink outside project root "${projectRoot}".`
-      );
-    }
+    const segments = lexicalRel.split(path.sep).filter(Boolean);
+    const posixRel = resolveCanonicalRepoPath(
+      resolvedRoot,
+      realRoot,
+      segments,
+      raw
+    );
 
-    const posixRel = lexicalRel.split(path.sep).join("/");
     if (!seen.has(posixRel)) {
       seen.add(posixRel);
       normalized.push(posixRel);
@@ -431,7 +570,7 @@ export function normalizeRepoPaths(
   return normalized;
 }
 
-const GLOB_META_REGEX = /[*?[\]{}]/;
+const GLOB_META_REGEX = /[*?[\]{}!+@]/;
 
 function hasGlobMeta(p: string): boolean {
   return GLOB_META_REGEX.test(p);
@@ -451,13 +590,56 @@ function isPathNested(a: string, b: string): boolean {
   return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
 
+function normalizePathCase(p: string): string {
+  return process.platform === "win32" || process.platform === "darwin"
+    ? p.toLowerCase()
+    : p;
+}
+
+/**
+ * Checks whether a glob pattern can match a concrete path OR any file nested
+ * under a concrete directory path.
+ */
+function globOverlapsConcretePath(globPattern: string, concretePath: string): boolean {
+  if (new Bun.Glob(globPattern).match(concretePath)) return true;
+
+  const prefix = globStaticPrefix(globPattern);
+  // Concrete path is equal to or a parent directory of the glob's static root
+  if (prefix.length > 0 && (prefix === concretePath || prefix.startsWith(`${concretePath}/`))) {
+    return true;
+  }
+
+  const patSegs = globPattern.split("/");
+  const tgtSegs = concretePath.split("/");
+  const doubleStarIdx = patSegs.indexOf("**");
+
+  if (doubleStarIdx !== -1) {
+    const preDouble = patSegs.slice(0, doubleStarIdx);
+    if (preDouble.length === 0) {
+      return true;
+    }
+    const checkCount = Math.min(preDouble.length, tgtSegs.length);
+    const subPat = preDouble.slice(0, checkCount).join("/");
+    const subTgt = tgtSegs.slice(0, checkCount).join("/");
+    return new Bun.Glob(subPat).match(subTgt);
+  }
+
+  // Non-** glob can still match files inside directory `concretePath` if depth allows
+  if (tgtSegs.length < patSegs.length) {
+    const subPat = patSegs.slice(0, tgtSegs.length).join("/");
+    return new Bun.Glob(subPat).match(concretePath);
+  }
+
+  return false;
+}
+
 /**
  * Checks whether two normalized relative POSIX repo paths (files, directories, or globs)
  * overlap and could cause parallel subagents to edit conflicting targets.
  */
 export function doRepoPathsConflict(pathA: string, pathB: string): boolean {
-  const a = pathA.replace(/\/+$/, "");
-  const b = pathB.replace(/\/+$/, "");
+  const a = normalizePathCase(pathA.replace(/\/+$/, ""));
+  const b = normalizePathCase(pathB.replace(/\/+$/, ""));
   if (!a || !b) return false;
   if (a === b) return true;
 
@@ -469,25 +651,31 @@ export function doRepoPathsConflict(pathA: string, pathB: string): boolean {
   }
 
   if (aGlob && !bGlob) {
-    if (new Bun.Glob(a).match(b)) return true;
-    const prefixA = globStaticPrefix(a);
-    return prefixA.length > 0 && (prefixA === b || prefixA.startsWith(`${b}/`));
+    return globOverlapsConcretePath(a, b);
   }
 
   if (!aGlob && bGlob) {
-    if (new Bun.Glob(b).match(a)) return true;
-    const prefixB = globStaticPrefix(b);
-    return prefixB.length > 0 && (prefixB === a || prefixB.startsWith(`${a}/`));
+    return globOverlapsConcretePath(b, a);
   }
 
   // Both paths contain glob wildcards
+  if (new Bun.Glob(a).match(b) || new Bun.Glob(b).match(a)) return true;
+
   const prefixA = globStaticPrefix(a);
   const prefixB = globStaticPrefix(b);
-  if (new Bun.Glob(a).match(b) || new Bun.Glob(b).match(a)) return true;
-  if (prefixA && new Bun.Glob(b).match(prefixA)) return true;
-  if (prefixB && new Bun.Glob(a).match(prefixB)) return true;
-  if (prefixA && prefixB && (a.includes("**") || b.includes("**"))) {
-    return isPathNested(prefixA, prefixB);
+
+  if (!prefixA) {
+    if (a.includes("**") || !prefixB) return true;
+    return globOverlapsConcretePath(a, prefixB);
   }
-  return prefixA.length > 0 && prefixA === prefixB;
+  if (!prefixB) {
+    if (b.includes("**")) return true;
+    return globOverlapsConcretePath(b, prefixA);
+  }
+
+  if (prefixA === prefixB) return true;
+  if (globOverlapsConcretePath(a, prefixB) || globOverlapsConcretePath(b, prefixA)) {
+    return true;
+  }
+  return false;
 }

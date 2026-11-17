@@ -1,8 +1,12 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { initProjectConfig } from "../src/config/project-config.ts";
+import {
+  doRepoPathsConflict,
+  initProjectConfig,
+  normalizeRepoPaths,
+} from "../src/config/project-config.ts";
 import { computeTopologicalWaves } from "../src/domain/dag.ts";
 import { TaskScheduler } from "../src/domain/scheduler.ts";
 import { DatabaseManager } from "../src/storage/database.ts";
@@ -195,9 +199,14 @@ describe("Scheduler DAG, isolation, shared context, and dynamic task splitting",
 
     const claim = scheduler.claimNextTask(projDir, "agent-1");
     expect(claim.task?.id).toBe("TASK-1");
-    scheduler.updateTask(projDir, "TASK-1", {
-      handoff_notes: "Drafted callback route; discovered missing crypto helper",
-    });
+    scheduler.updateTask(
+      projDir,
+      "TASK-1",
+      {
+        handoff_notes: "Drafted callback route; discovered missing crypto helper",
+      },
+      "agent-1"
+    );
 
     // Inject prerequisite TASK-2 blocking active TASK-1
     const injected = scheduler.createTasksBatch(projDir, [
@@ -315,5 +324,125 @@ describe("Scheduler DAG, isolation, shared context, and dynamic task splitting",
     expect(suspendedApi.claimed_by).toBeNull();
     expect(suspendedApi.depends_on).toEqual(["TASK-1", "TASK-3"]);
     expect(suspendedApi.handoff_notes).toContain("Auto-suspended");
+  });
+
+  test("enforces updateTask state/reopen/flag guards, rejects reserved keys, and isolates failed categories", async () => {
+    const projDir = path.join(tempRoot, "state-guards-proj");
+    mkdirSync(projDir, { recursive: true });
+    initProjectConfig({ dir: projDir, projectName: "state-guards-proj" });
+
+    // Reject reserved TASK-\d+ local keys
+    expect(() =>
+      scheduler.createTasksBatch(projDir, [{ key: "TASK-1", title: "Reserved key" }])
+    ).toThrow(TasklistError);
+    expect(() =>
+      scheduler.createTasksBatch(projDir, [{ key: "task-42", title: "Reserved lower" }])
+    ).toThrow(TasklistError);
+
+    scheduler.createTasksBatch(projDir, [
+      { key: "base", title: "Base task", category: "backend" },
+      { key: "child", title: "Child task", category: "backend", depends_on: ["base"] },
+      { key: "broken", title: "Broken other category", category: "ops" },
+    ]);
+
+    // Fail ops task; backend claim must still succeed (not blocked by failed ops task)
+    const opsClaim = scheduler.claimNextTask(projDir, "ops-agent", { category: "ops" });
+    expect(opsClaim.task?.id).toBe("TASK-3");
+    scheduler.blockOrFailTask(projDir, "TASK-3", {
+      agent_id: "ops-agent",
+      outcome: "failed",
+      reason: "Ops environment broken",
+    });
+
+    const backendClaim = scheduler.claimNextTask(projDir, "be-agent", {
+      category: "backend",
+    });
+    expect(backendClaim.outcome).toBe("TASK_CLAIMED");
+    expect(backendClaim.task?.id).toBe("TASK-1");
+
+    // Reject conflicting release_claim + reset_to_pending
+    expect(() =>
+      scheduler.updateTask(
+        projDir,
+        "TASK-1",
+        { release_claim: true, reset_to_pending: true },
+        "be-agent"
+      )
+    ).toThrow(TasklistError);
+
+    await scheduler.completeTask(projDir, "TASK-1", {
+      agent_id: "be-agent",
+      verification_note: "Base complete",
+    });
+
+    // Cannot mutate done task without reset_to_pending=true
+    expect(() =>
+      scheduler.updateTask(
+        projDir,
+        "TASK-1",
+        { title: "Silent edit on done task" },
+        "be-agent"
+      )
+    ).toThrow(TasklistError);
+
+    // Claim TASK-2 (child of TASK-1); reopening TASK-1 must fail while dependent TASK-2 is in_progress
+    const childClaim = scheduler.claimNextTask(projDir, "be-agent", {
+      category: "backend",
+    });
+    expect(childClaim.task?.id).toBe("TASK-2");
+
+    expect(() =>
+      scheduler.updateTask(
+        projDir,
+        "TASK-1",
+        { reset_to_pending: true },
+        "be-agent"
+      )
+    ).toThrow(TasklistError);
+
+    // Also cannot reopen TASK-1 if TASK-2 is already done
+    await scheduler.completeTask(projDir, "TASK-2", {
+      agent_id: "be-agent",
+      verification_note: "Child complete",
+    });
+    expect(() =>
+      scheduler.updateTask(
+        projDir,
+        "TASK-1",
+        { reset_to_pending: true },
+        "be-agent"
+      )
+    ).toThrow(TasklistError);
+  });
+
+  test("normalizeRepoPaths handles Windows separators, internal aliases, dangling symlinks, and doRepoPathsConflict glob overlaps", () => {
+    const projDir = path.join(tempRoot, "paths-proj");
+    mkdirSync(path.join(projDir, "src", "real-dir"), { recursive: true });
+    writeFileSync(path.join(projDir, "src", "real-dir", "auth.ts"), "export {};\n", "utf8");
+
+    // Backslash normalization + canonicalization of internal symlink alias
+    symlinkSync(
+      path.join(projDir, "src", "real-dir"),
+      path.join(projDir, "src", "alias-dir"),
+      "dir"
+    );
+    expect(
+      normalizeRepoPaths(projDir, ["src\\alias-dir\\auth.ts", "./src/real-dir/new.ts"])
+    ).toEqual(["src/real-dir/auth.ts", "src/real-dir/new.ts"]);
+
+    // Dangling symlink must be rejected
+    symlinkSync(
+      path.join(tempRoot, "nonexistent-outside-target"),
+      path.join(projDir, "src", "dangling-link")
+    );
+    expect(() => normalizeRepoPaths(projDir, ["src/dangling-link/file.ts"])).toThrow(
+      TasklistError
+    );
+
+    // Deep glob overlaps against directories and other globs
+    expect(doRepoPathsConflict("src/**/*.ts", "src/auth")).toBe(true);
+    expect(doRepoPathsConflict("**/*.ts", "src/auth/*")).toBe(true);
+    expect(doRepoPathsConflict("src/*/*.ts", "src/api/*")).toBe(true);
+    expect(doRepoPathsConflict("src/auth/*.ts", "docs/readme.md")).toBe(false);
   });
 });
