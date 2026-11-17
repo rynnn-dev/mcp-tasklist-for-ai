@@ -5,6 +5,7 @@ import {
   mkdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import os from "node:os";
@@ -12,6 +13,7 @@ import path from "node:path";
 import {
   ensureGitignoreEntry,
   initProjectConfig,
+  normalizeRepoPaths,
   resolveProjectConfig,
 } from "../src/config/project-config.ts";
 import { DatabaseManager } from "../src/storage/database.ts";
@@ -192,5 +194,27 @@ describe("CLI init & per-project config", () => {
     const parsedStatus = JSON.parse(statusProc.stdout.toString());
     expect(parsedStatus.project.project_name).toBe("cli-e2e");
     expect(parsedStatus.counts.total).toBe(0);
+  });
+
+  test("normalizeRepoPaths rejects symlinks pointing outside project root", () => {
+    const projDir = path.join(tempRoot, "symlink-proj");
+    const outsideDir = path.join(tempRoot, "outside-secret");
+    mkdirSync(path.join(projDir, "src"), { recursive: true });
+    mkdirSync(outsideDir, { recursive: true });
+    writeFileSync(path.join(outsideDir, "secret.txt"), "top-secret", "utf8");
+
+    symlinkSync(outsideDir, path.join(projDir, "src", "leak-link"), "dir");
+
+    expect(() =>
+      normalizeRepoPaths(projDir, ["src/leak-link/secret.txt"])
+    ).toThrow(TasklistError);
+
+    expect(() =>
+      normalizeRepoPaths(projDir, ["src/leak-link/new-child.ts"])
+    ).toThrow(TasklistError);
+
+    expect(normalizeRepoPaths(projDir, ["./src/valid.ts"])).toEqual([
+      "src/valid.ts",
+    ]);
   });
 });

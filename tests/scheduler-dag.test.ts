@@ -265,4 +265,55 @@ describe("Scheduler DAG, isolation, shared context, and dynamic task splitting",
     const detail3 = scheduler.getTaskDetail(projDir, "TASK-3");
     expect(detail3.events.every((e) => e.event_type !== "TASK_DELETED")).toBe(true);
   });
+
+  test("updateTask(add_depends_on) enforces DAG invariants and claimNextTask(category) avoids false BLOCKED_BY_FAILURES", async () => {
+    const projDir = path.join(tempRoot, "dag-invariant-proj");
+    mkdirSync(projDir, { recursive: true });
+    initProjectConfig({ dir: projDir, projectName: "dag-invariant-proj" });
+
+    scheduler.createTasksBatch(projDir, [
+      { key: "infra", title: "Setup infra", category: "infra" },
+      { key: "api", title: "Build API", category: "backend", depends_on: ["infra"] },
+      { key: "docs", title: "Write docs", category: "docs" },
+    ]);
+
+    // Filtering by category="backend" when TASK-2 is pending its "infra" prerequisite (zero failures)
+    // must report WAITING_ON_ACTIVE_TASKS, NOT BLOCKED_BY_FAILURES
+    const backendWaiting = scheduler.claimNextTask(projDir, "backend-agent", {
+      category: "backend",
+    });
+    expect(backendWaiting.outcome).toBe("WAITING_ON_ACTIVE_TASKS");
+
+    // Claim and complete TASK-1 ("infra")
+    const claimInfra = scheduler.claimNextTask(projDir, "infra-agent", {
+      category: "infra",
+    });
+    expect(claimInfra.task?.id).toBe("TASK-1");
+    await scheduler.completeTask(projDir, "TASK-1", {
+      agent_id: "infra-agent",
+      verification_note: "Infra ready",
+    });
+
+    // Cannot add unfinished dependency TASK-3 onto already-done TASK-1
+    expect(() =>
+      scheduler.updateTask(projDir, "TASK-1", { add_depends_on: ["TASK-3"] })
+    ).toThrow(TasklistError);
+
+    // Claim TASK-2 ("api") -> adding unfinished dependency TASK-3 auto-suspends TASK-2 back to pending
+    const claimApi = scheduler.claimNextTask(projDir, "backend-agent", {
+      category: "backend",
+    });
+    expect(claimApi.task?.id).toBe("TASK-2");
+
+    const suspendedApi = scheduler.updateTask(
+      projDir,
+      "TASK-2",
+      { add_depends_on: ["TASK-3"] },
+      "backend-agent"
+    );
+    expect(suspendedApi.status).toBe("pending");
+    expect(suspendedApi.claimed_by).toBeNull();
+    expect(suspendedApi.depends_on).toEqual(["TASK-1", "TASK-3"]);
+    expect(suspendedApi.handoff_notes).toContain("Auto-suspended");
+  });
 });

@@ -1,4 +1,5 @@
 import {
+  doRepoPathsConflict,
   normalizeRepoPaths,
   resolveProjectConfig,
 } from "../config/project-config.ts";
@@ -585,18 +586,13 @@ export class TaskScheduler {
 
       // 2. Active file locks across all active in_progress tasks
       const activeTasks = allTasks.filter((t) => t.status === "in_progress");
-      const lockedFileOwners = new Map<string, string[]>();
-      for (const active of activeTasks) {
-        const touched = new Set([...active.affected_files, ...active.modified_files]);
-        for (const file of touched) {
-          const owners = lockedFileOwners.get(file);
-          if (owners) {
-            owners.push(active.id);
-          } else {
-            lockedFileOwners.set(file, [active.id]);
-          }
-        }
-      }
+      const activeLockedEntries: Array<{ taskId: string; patterns: string[] }> =
+        activeTasks.map((active) => ({
+          taskId: active.id,
+          patterns: Array.from(
+            new Set([...active.affected_files, ...active.modified_files])
+          ),
+        }));
 
       // 3. Find unblocked pending candidates
       const unblockedPending = allTasks.filter((t) => {
@@ -621,11 +617,20 @@ export class TaskScheduler {
       for (const candidate of unblockedPending) {
         const conflictingFiles: string[] = [];
         const lockingTasks = new Set<string>();
-        for (const file of candidate.affected_files) {
-          const owners = lockedFileOwners.get(file);
-          if (owners && owners.length > 0) {
-            conflictingFiles.push(file);
-            for (const o of owners) lockingTasks.add(o);
+        for (const candidateFile of candidate.affected_files) {
+          let fileHasConflict = false;
+          for (const activeEntry of activeLockedEntries) {
+            if (
+              activeEntry.patterns.some((activeFile) =>
+                doRepoPathsConflict(candidateFile, activeFile)
+              )
+            ) {
+              fileHasConflict = true;
+              lockingTasks.add(activeEntry.taskId);
+            }
+          }
+          if (fileHasConflict) {
+            conflictingFiles.push(candidateFile);
           }
         }
 
@@ -753,6 +758,21 @@ export class TaskScheduler {
         };
       }
 
+      if (blockedOrFailed.length === 0 && options.category) {
+        return {
+          outcome: "WAITING_ON_ACTIVE_TASKS",
+          task: null,
+          project_shared_context: project.shared_context,
+          prerequisite_handoffs: [],
+          stale_reclaimed_task_ids: staleReclaimedIds,
+          stale_failed_task_ids: staleFailedIds,
+          skipped_due_to_file_locks: skippedDueToLocks,
+          active_tasks: activeSummary,
+          blocked_or_failed_tasks: blockedOrFailed,
+          message: `No actionable pending tasks match category "${options.category}" right now; pending prerequisite/sibling tasks remain in other categories.`,
+        };
+      }
+
       return {
         outcome: "BLOCKED_BY_FAILURES",
         task: null,
@@ -766,9 +786,7 @@ export class TaskScheduler {
         message:
           blockedOrFailed.length > 0
             ? `Queue is stalled by ${blockedOrFailed.length} blocked/failed task(s). Resolve or reset them via update_task(reset_to_pending=true) before continuing.`
-            : options.category
-              ? `No actionable pending tasks match category "${options.category}", while other tasks remain incomplete.`
-              : "Queue is stalled: pending tasks have unsatisfied or broken dependencies.",
+            : "Queue is stalled: pending tasks have unsatisfied or broken dependencies.",
       };
     });
   }
@@ -881,11 +899,13 @@ export class TaskScheduler {
       }
 
       // Dependency graph mutations
+      let suspendedByAddedDeps: string[] | null = null;
       if (
         (patch.add_depends_on && patch.add_depends_on.length > 0) ||
         (patch.remove_depends_on && patch.remove_depends_on.length > 0)
       ) {
         const allTasks = this.repo.listTasksByProject(projectId);
+        const taskMap = new Map(allTasks.map((t) => [t.id, t]));
         const allTaskIds = new Set(allTasks.map((t) => t.id));
         const removeSet = new Set(patch.remove_depends_on ?? []);
         const addList = patch.add_depends_on ?? [];
@@ -896,6 +916,23 @@ export class TaskScheduler {
               "INVALID_DEPENDENCY",
               `Dependency target "${depId}" does not exist.`
             );
+          }
+        }
+
+        const unfinishedAddedDeps = addList.filter(
+          (depId) => taskMap.get(depId)?.status !== "done"
+        );
+        if (unfinishedAddedDeps.length > 0 && !patch.reset_to_pending) {
+          if (existing.status === "done") {
+            throw new TasklistError(
+              "INVALID_STATE_TRANSITION",
+              `Cannot add unfinished prerequisite(s) (${unfinishedAddedDeps.join(
+                ", "
+              )}) to already-completed task "${taskId}". Pass reset_to_pending=true to reopen it first.`
+            );
+          }
+          if (existing.status === "in_progress") {
+            suspendedByAddedDeps = unfinishedAddedDeps;
           }
         }
 
@@ -924,7 +961,30 @@ export class TaskScheduler {
         }
       }
 
+      if (suspendedByAddedDeps) {
+        const suspendNote = `[Auto-suspended waiting on added prerequisite(s): ${suspendedByAddedDeps.join(
+          ", "
+        )}]`;
+        const baseHandoff = updateFields.handoff_notes ?? existing.handoff_notes;
+        updateFields.status = "pending";
+        updateFields.claimed_by = null;
+        updateFields.claimed_at = null;
+        updateFields.heartbeat_at = null;
+        updateFields.handoff_notes = baseHandoff
+          ? `${baseHandoff}\n${suspendNote}`
+          : suspendNote;
+      }
+
       this.repo.updateTaskRow(projectId, taskId, updateFields);
+      if (suspendedByAddedDeps) {
+        this.repo.recordEvent(
+          projectId,
+          taskId,
+          "TASK_SUSPENDED_BY_PREREQUISITE",
+          effectiveActor,
+          { prerequisite_ids: suspendedByAddedDeps }
+        );
+      }
       this.repo.recordEvent(projectId, taskId, "TASK_UPDATED", effectiveActor, {
         reset_to_pending: patch.reset_to_pending ?? false,
         heartbeat: patch.heartbeat ?? false,
@@ -958,14 +1018,14 @@ export class TaskScheduler {
         );
       }
 
-      if (task.status !== "in_progress" && task.status !== "pending") {
+      if (task.status !== "in_progress") {
         throw new TasklistError(
           "INVALID_STATE_TRANSITION",
-          `Cannot complete task "${taskId}" from status "${task.status}". Only "in_progress" or "pending" tasks can be completed.`
+          `Cannot complete task "${taskId}" from status "${task.status}". Only "in_progress" tasks claimed via claim_next_task can be completed.`
         );
       }
 
-      if (task.status === "in_progress" && task.claimed_by) {
+      if (task.claimed_by) {
         if (!cleanAgentId || task.claimed_by !== cleanAgentId) {
           throw new TasklistError(
             "TASK_LOCKED",
@@ -1002,11 +1062,9 @@ export class TaskScheduler {
             )
           : task.modified_files;
 
-      if (task.status === "in_progress") {
-        this.repo.updateTaskRow(projectId, taskId, {
-          heartbeat_at: new Date().toISOString(),
-        });
-      }
+      this.repo.updateTaskRow(projectId, taskId, {
+        heartbeat_at: new Date().toISOString(),
+      });
 
       return {
         resolved,

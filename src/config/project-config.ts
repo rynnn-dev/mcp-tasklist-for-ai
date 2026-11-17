@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import {
   existsSync,
   readFileSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
@@ -161,7 +162,7 @@ export function ensureGitignoreEntry(
 }
 
 /**
- * Initializes a per-project configuration file (.tasklist.json by default)
+ * Initializes a per-project configuration file (.moex.json by default)
  * in the target project root directory.
  */
 export function initProjectConfig(options: InitProjectOptions): InitProjectResult {
@@ -352,8 +353,39 @@ export function resolveProjectConfig(
 }
 
 /**
+ * Resolves the canonical filesystem path for absPath by finding the deepest existing
+ * ancestor via realpathSync and reattaching any not-yet-created trailing segments.
+ */
+function resolveThroughExistingAncestor(absPath: string): string {
+  const trailing: string[] = [];
+  let cursor = path.resolve(absPath);
+
+  while (!existsSync(cursor)) {
+    const parent = path.dirname(cursor);
+    if (parent === cursor) {
+      return cursor;
+    }
+    trailing.unshift(path.basename(cursor));
+    cursor = parent;
+  }
+
+  const realBase = realpathSync(cursor);
+  return trailing.length > 0 ? path.join(realBase, ...trailing) : realBase;
+}
+
+function isEscapingRelativePath(rel: string): boolean {
+  return (
+    rel === "" ||
+    rel === "." ||
+    rel === ".." ||
+    rel.startsWith(`..${path.sep}`) ||
+    path.isAbsolute(rel)
+  );
+}
+
+/**
  * Normalizes file paths to clean relative POSIX paths rooted at projectRoot.
- * Rejects path traversal outside projectRoot.
+ * Rejects both lexical path traversal and symlinks pointing outside projectRoot.
  */
 export function normalizeRepoPaths(
   projectRoot: string,
@@ -361,6 +393,9 @@ export function normalizeRepoPaths(
 ): string[] {
   const seen = new Set<string>();
   const normalized: string[] = [];
+  const realRoot = existsSync(projectRoot)
+    ? realpathSync(projectRoot)
+    : path.resolve(projectRoot);
 
   for (const raw of paths) {
     const trimmed = raw.trim();
@@ -369,22 +404,24 @@ export function normalizeRepoPaths(
     const absTarget = path.isAbsolute(trimmed)
       ? path.resolve(trimmed)
       : path.resolve(projectRoot, trimmed);
-    const rel = path.relative(projectRoot, absTarget);
-
-    if (
-      rel === "" ||
-      rel === "." ||
-      rel === ".." ||
-      rel.startsWith(`..${path.sep}`) ||
-      path.isAbsolute(rel)
-    ) {
+    const lexicalRel = path.relative(projectRoot, absTarget);
+    if (isEscapingRelativePath(lexicalRel)) {
       throw new TasklistError(
         "INVALID_PATH",
         `File path "${raw}" escapes project root "${projectRoot}" or refers to root itself.`
       );
     }
 
-    const posixRel = rel.split(path.sep).join("/");
+    const realTarget = resolveThroughExistingAncestor(absTarget);
+    const realRel = path.relative(realRoot, realTarget);
+    if (isEscapingRelativePath(realRel)) {
+      throw new TasklistError(
+        "INVALID_PATH",
+        `File path "${raw}" resolves via symlink outside project root "${projectRoot}".`
+      );
+    }
+
+    const posixRel = lexicalRel.split(path.sep).join("/");
     if (!seen.has(posixRel)) {
       seen.add(posixRel);
       normalized.push(posixRel);
@@ -392,4 +429,65 @@ export function normalizeRepoPaths(
   }
 
   return normalized;
+}
+
+const GLOB_META_REGEX = /[*?[\]{}]/;
+
+function hasGlobMeta(p: string): boolean {
+  return GLOB_META_REGEX.test(p);
+}
+
+function globStaticPrefix(pattern: string): string {
+  const parts = pattern.split("/");
+  const prefixParts: string[] = [];
+  for (const part of parts) {
+    if (hasGlobMeta(part)) break;
+    prefixParts.push(part);
+  }
+  return prefixParts.join("/");
+}
+
+function isPathNested(a: string, b: string): boolean {
+  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+}
+
+/**
+ * Checks whether two normalized relative POSIX repo paths (files, directories, or globs)
+ * overlap and could cause parallel subagents to edit conflicting targets.
+ */
+export function doRepoPathsConflict(pathA: string, pathB: string): boolean {
+  const a = pathA.replace(/\/+$/, "");
+  const b = pathB.replace(/\/+$/, "");
+  if (!a || !b) return false;
+  if (a === b) return true;
+
+  const aGlob = hasGlobMeta(a);
+  const bGlob = hasGlobMeta(b);
+
+  if (!aGlob && !bGlob) {
+    return isPathNested(a, b);
+  }
+
+  if (aGlob && !bGlob) {
+    if (new Bun.Glob(a).match(b)) return true;
+    const prefixA = globStaticPrefix(a);
+    return prefixA.length > 0 && (prefixA === b || prefixA.startsWith(`${b}/`));
+  }
+
+  if (!aGlob && bGlob) {
+    if (new Bun.Glob(b).match(a)) return true;
+    const prefixB = globStaticPrefix(b);
+    return prefixB.length > 0 && (prefixB === a || prefixB.startsWith(`${a}/`));
+  }
+
+  // Both paths contain glob wildcards
+  const prefixA = globStaticPrefix(a);
+  const prefixB = globStaticPrefix(b);
+  if (new Bun.Glob(a).match(b) || new Bun.Glob(b).match(a)) return true;
+  if (prefixA && new Bun.Glob(b).match(prefixA)) return true;
+  if (prefixB && new Bun.Glob(a).match(prefixB)) return true;
+  if (prefixA && prefixB && (a.includes("**") || b.includes("**"))) {
+    return isPathNested(prefixA, prefixB);
+  }
+  return prefixA.length > 0 && prefixA === prefixB;
 }

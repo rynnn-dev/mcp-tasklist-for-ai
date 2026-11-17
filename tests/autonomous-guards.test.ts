@@ -385,4 +385,59 @@ describe("Autonomous Guardrails: Active Verification Gate, Stale Recovery, & Fil
     });
     expect(done.task.status).toBe("done");
   });
+
+  test("File Scope Conflict Detection catches directory/glob overlaps and completeTask rejects un-claimed pending tasks", async () => {
+    const projDir = path.join(tempRoot, "glob-lock-proj");
+    mkdirSync(projDir, { recursive: true });
+    initProjectConfig({ dir: projDir, projectName: "glob-lock-proj" });
+
+    scheduler.createTasksBatch(projDir, [
+      {
+        title: "Refactor auth module directory",
+        priority: "high",
+        affected_files: ["src/auth"],
+      },
+      {
+        title: "Update auth login handler",
+        priority: "high",
+        affected_files: ["src/auth/login.ts"],
+      },
+      {
+        title: "Update all test files via glob",
+        priority: "medium",
+        affected_files: ["tests/*.test.ts"],
+      },
+      {
+        title: "Edit specific unit test file",
+        priority: "low",
+        affected_files: ["tests/auth.test.ts"],
+      },
+    ]);
+
+    // Cannot complete a pending task before claiming it
+    await expect(
+      scheduler.completeTask(projDir, "TASK-1", {
+        agent_id: "shortcut-agent",
+        verification_note: "Trying to skip claim",
+      })
+    ).rejects.toThrow(TasklistError);
+
+    // Worker 1 claims TASK-1 (locks src/auth directory)
+    const c1 = scheduler.claimNextTask(projDir, "worker-1");
+    expect(c1.task?.id).toBe("TASK-1");
+
+    // Worker 2: TASK-2 (src/auth/login.ts) conflicts with TASK-1 (src/auth), so TASK-3 is claimed
+    const c2 = scheduler.claimNextTask(projDir, "worker-2");
+    expect(c2.outcome).toBe("TASK_CLAIMED");
+    expect(c2.task?.id).toBe("TASK-3");
+    expect(c2.skipped_due_to_file_locks.map((s) => s.task_id)).toEqual(["TASK-2"]);
+
+    // Worker 3: TASK-2 conflicts with src/auth, TASK-4 (tests/auth.test.ts) conflicts with tests/*.test.ts
+    const c3 = scheduler.claimNextTask(projDir, "worker-3");
+    expect(c3.outcome).toBe("WAITING_ON_ACTIVE_TASKS");
+    expect(c3.skipped_due_to_file_locks.map((s) => s.task_id)).toEqual([
+      "TASK-2",
+      "TASK-4",
+    ]);
+  });
 });
